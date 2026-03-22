@@ -1,6 +1,9 @@
 # Personal eBird data
 MyEBirdData.csv
 
+# Local API keys — never commit
+config_local.R
+
 # Downloaded raster cache (large files)
 ne_admin1_large.rds
 

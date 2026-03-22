@@ -35,7 +35,16 @@ annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "light_blue" # accepted values "light_blue", "dark", "light_green"
 
-set_ebirdst_access_key('ssecerukpnav', overwrite = T)
+# API keys — loaded from config_local.R (gitignored, never committed).
+# To set up your own keys:
+#   1. eBird Status & Trends key: request at https://ebird.org/st/request
+#   2. eBird API key: request at https://ebird.org/api/keygen
+# Copy config_local.R.example to config_local.R and fill in your keys.
+if (!file.exists(here("config_local.R"))) {
+  stop("config_local.R not found. Copy config_local.R.example to config_local.R and add your API keys. See https://ebird.org/st/request and https://ebird.org/api/keygen")
+}
+source(here("config_local.R"))
+set_ebirdst_access_key(ebirdst_key, overwrite = TRUE)
 
 # Make directories to save outputs
 user_file <- tolower(str_replace(user, " ", ""))
@@ -76,7 +85,7 @@ sp_user_region <- sp_user_region %>%
   filter(category == "species")
 
 # All species observed in region (by anyone)
-sp_region <- ebirdregionspecies(region, key = 'sl2et8an5i1r') %>%
+sp_region <- ebirdregionspecies(region, key = ebird_api_key) %>%
   left_join(sp_all) %>%
   drop_na(Common.Name)
 
