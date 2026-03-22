@@ -351,25 +351,38 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
       legend.text.align = 0.5
     )
   week_plot
-  ggsave(filename = here(outputDir, "Weekly_maps", paste0(region, "_", date, ".jpg")), plot = week_plot, bg = "white", height = 5.35, width = 6.6)
+  jpg_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".jpg"))
+  if (!file.exists(jpg_path)) {
+    ggsave(filename = jpg_path, plot = week_plot, bg = "white", height = 5.35, width = 6.6)
+  }
   week_plots_possible[[i]] <- week_plot
 }
 
 # Generate animated gif (full size and smaller for sharing)
-imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
-img_joined <- image_join(lapply(imgs, image_read))
 fps_val <- if (annotate == TRUE) 0.5 else 5
 image_path <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
   "_hires_", if (annotate) "annotated_", user_file, ".gif"
 ))
-# Use image_write_gif (gifski backend) to avoid ImageMagick segfault on large GIFs
-image_write_gif(img_joined, path = image_path, delay = 1 / fps_val)
-
-# Scale down for sharing (from in-memory frames, avoid re-reading the large GIF)
-lores <- image_scale(img_joined, geometry_size_percent(width = 38, height = NULL))
 image_path_lores <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
   "_lores_", if (annotate) "annotated_", user_file, ".gif"
 ))
-image_write_gif(lores, path = image_path_lores, delay = 1 / fps_val)
+
+if (!file.exists(image_path) || !file.exists(image_path_lores)) {
+  imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
+  img_joined <- image_join(lapply(imgs, image_read))
+
+  # Use image_write_gif (gifski backend) to avoid ImageMagick segfault on large GIFs
+  if (!file.exists(image_path)) {
+    image_write_gif(img_joined, path = image_path, delay = 1 / fps_val)
+  }
+
+  # Scale down for sharing (from in-memory frames, avoid re-reading the large GIF)
+  if (!file.exists(image_path_lores)) {
+    lores <- image_scale(img_joined, geometry_size_percent(width = 38, height = NULL))
+    image_write_gif(lores, path = image_path_lores, delay = 1 / fps_val)
+  }
+} else {
+  message("Animated GIFs already exist, skipping.")
+}
