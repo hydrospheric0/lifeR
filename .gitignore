@@ -7,14 +7,5 @@ config_local.R
 # Local push script
 pushit.sh
 
-# Downloaded raster cache (large files)
-ne_admin1_large.rds
-
 # Script output
 Results/
-
-# R session artifacts
-.Rhistory
-.RData
-.Rproj.user/
-*.Rproj

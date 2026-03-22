@@ -1,16 +1,10 @@
-# lifeR — Personal Lifer Bird Mapper
-
-Generate animated maps of the birds you still need to see, using eBird Status & Trends occurrence data.
+# lifeR
 
 ---
 
-## Based on Sam Safran's lifeR
+This R script was developed by Samuel Safran to generate personal maps of potential lifer birds using ebirdst and terra. See his post here for overview: https://smsfrn.github.io/posts/2024/01/lifer-mapper/
 
-**This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR) by Sam Safran.**
-All core logic and the original concept are Sam's work. His write-up is a great introduction to what this tool does:
-👉 https://smsfrn.github.io/posts/2024/01/lifer-mapper/
-
-Changes made in this fork are documented in the commit history and summarized below.
+This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR). Changes made in this fork are documented in the commit history and summarized below.
 
 ---
 
