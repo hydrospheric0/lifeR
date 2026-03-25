@@ -24,16 +24,23 @@ library(magick)
 
 here()
 
+# Store S&T rasters in the project folder (data/ebirdst/) rather than the
+# hidden R per-user directory.  Python scripts and R scripts share this path.
+# Must be set before any ebirdst function is called.
+ebirdst_cache_dir <- here("data", "ebirdst")
+dir.create(ebirdst_cache_dir, recursive = TRUE, showWarnings = FALSE)
+Sys.setenv(EBIRDST_DATA_DIR = ebirdst_cache_dir)
+
 # Set parameters
 region <- "US" # must use eBird country or state-level regional codes. Examples: "US" (United States), "US-NY" (New York State, USA), "MX-TAM" (Tamaulipas, Mexico). Find state codes in the URL on eBird's regional pages or in Data/ebird_states.rda. Note that "US" is by default modified to only include continental US.
 user <- "Bart Wickel" # e.g., "Sam Safran" - this is typically your full name or username. Controls how you are identified in the map caption and is used in output file structure, so can't be empty.
 user_short <- NA # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
 your_ebird_dat <- here("MyEBirdData.csv") # path to where your personal eBird data are stored
 needs_list_to_use <- "regional" # set to "global" if you want to map true lifers (species you haven't observed anywhere); set to "regional" if you'd like to map needs for the specified region.
-resolution <- "9km" # "3km", "9km", or "27km"
+resolution <- "27km" # "3km", "9km", or "27km"
 annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
-theme <- "light_blue" # accepted values "light_blue", "dark", "light_green"
+theme <- "dark" # accepted values "light_blue", "dark", "light_green"
 
 # API keys — loaded from config_local.R (gitignored, never committed).
 # To set up your own keys:
@@ -88,6 +95,10 @@ sp_user_region <- sp_user_region %>%
 sp_region <- ebirdregionspecies(region, key = ebird_api_key) %>%
   left_join(sp_all) %>%
   drop_na(Common.Name)
+message(sprintf("[1/4] Species in %s regional checklist (eBird): %d", region, nrow(sp_region)))
+message(sprintf("      User species seen in %s (%s list): %d",
+  region, needs_list_to_use,
+  if (needs_list_to_use == "global") nrow(sp_user_all) else nrow(sp_user_region)))
 
 # User needs in region
 if (needs_list_to_use == "global") {
@@ -103,22 +114,45 @@ if (needs_list_to_use == "regional") {
     rename(Common.Name = ".") %>%
     left_join(sp_all)
 }
+message(sprintf("[2/4] Needed species (%s): %d", needs_list_to_use, nrow(sp_needed)))
 
 # All species with ebst data
 sp_ebst <- ebirdst_runs %>%
   rename(Common.Name = common_name)
 
-# All needed species with ebst data
-sp_ebst_for_run <- inner_join(sp_ebst, sp_needed) %>%
-  filter(!species_code %in% c("laugul","rocpig", "compea", "yebsap-example")) # not sure why Laughing Gull is tossing an error
+# All needed species with ebst data.
+# Primary join on Common.Name (robust across taxonomy versions).
+# Supplementary code join catches the rare cases where names differ between
+# rebird and ebirdst (e.g. "Common Hoopoe" in rebird vs "Eurasian Hoopoe"
+# in ebirdst_runs). The union then deduplicates by species_code.
+sp_ebst_for_run <- bind_rows(
+    inner_join(sp_ebst, sp_needed, by = "Common.Name"),
+    inner_join(
+      sp_ebst,
+      sp_needed %>% filter(!is.na(speciesCode)) %>% distinct(speciesCode) %>%
+        rename(species_code = speciesCode),
+      by = "species_code"
+    )
+  ) %>%
+  distinct(species_code, .keep_all = TRUE) %>%
+  filter(!species_code %in% c("laugul", "rocpig", "compea", "yebsap-example"))
+message(sprintf("[3/4] Needed species with eBird S&T model: %d  (no model for %d needed species)",
+  nrow(sp_ebst_for_run), nrow(sp_needed) - nrow(sp_ebst_for_run)))
 
 # Download occurrence data for needed sp. If annotating we also need species population proportion rasters.
-# Skip species whose local .tif already exists to avoid unnecessary network calls.
+# Skip species whose local .tif already exists AND is readable to avoid unnecessary network calls.
 ebirdst_cache <- ebirdst_data_dir()
-needs_download <- sp_ebst_for_run$species_code[!file.exists(
-  file.path(ebirdst_cache, "2023", sp_ebst_for_run$species_code, "weekly",
-            paste0(sp_ebst_for_run$species_code, "_occurrence_median_", resolution, "_2023.tif"))
-)]
+tif_paths <- file.path(ebirdst_cache, "2023", sp_ebst_for_run$species_code, "weekly",
+  paste0(sp_ebst_for_run$species_code, "_occurrence_median_", resolution, "_2023.tif"))
+is_valid_tif <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  tryCatch({ terra::rast(path); TRUE }, error = function(e) {
+    message("Corrupt/unreadable cache file, will re-download: ", basename(path))
+    file.remove(path)
+    FALSE
+  })
+}
+needs_download <- sp_ebst_for_run$species_code[!vapply(tif_paths, is_valid_tif, logical(1))]
 if (length(needs_download) > 0) {
   sapply(needs_download, ebirdst_download_status,
          download_abundance = TRUE, download_occurrence = TRUE,
@@ -134,8 +168,36 @@ if (length(needs_download) > 0) {
   message("All species data already cached, skipping download.")
 }
 
-# Load occurrence rasters for all species in species list
-occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
+# Guard against OOM at 3km — loading all ~560 species at 3km requires ~500 GB RAM.
+# Check available memory on Linux before proceeding; abort with a clear message if insufficient.
+if (resolution == "3km" && file.exists("/proc/meminfo")) {
+  mem_avail_kb <- as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1",
+    grep("MemAvailable", readLines("/proc/meminfo"), value = TRUE)[1]))
+  mem_avail_gb <- mem_avail_kb / 1e6
+  mem_required_gb <- 150  # conservative floor; 3km OOM observed below this
+  if (mem_avail_gb < mem_required_gb) {
+    stop(sprintf(paste0(
+      "3km loads ~9x more raster data than 9km.\n",
+      "  Available RAM : %.0f GB\n",
+      "  Required (est): %.0f GB\n",
+      "Switch to resolution = '9km' or '27km', or run on a machine with more RAM."),
+      mem_avail_gb, mem_required_gb))
+  }
+  message(sprintf("[RAM check] 3km: %.0f GB available — proceeding.", mem_avail_gb))
+}
+
+# Load occurrence rasters for all species in species list (skip any that fail to load)
+load_raster_safe <- function(sp_code, ...) {
+  tryCatch(
+    load_raster(sp_code, ...),
+    error = function(e) {
+      message("Skipping ", sp_code, " — could not load raster: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster_safe, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
+occ_combined <- Filter(Negate(is.null), occ_combined)
 
 # Load proportion population rasters for all species in species list
 if (annotate == TRUE) {
@@ -201,13 +263,16 @@ sp_ebst_for_run_in_region <- left_join(
     rename("max_val" = "."),
   y = sp_ebst_for_run
 )
+message(sprintf("[4/4] Species exceeding %.0f%% occurrence threshold anywhere in %s: %d  (dropped %d below threshold)",
+  possible_occurrence_threshold * 100, region,
+  nrow(sp_ebst_for_run_in_region), nrow(sp_ebst_for_run) - nrow(sp_ebst_for_run_in_region)))
 
 # Function for viewing summarized species rasters (not run)
 view_sp <- function(x) {
   sp_max <- (raster::raster(max(occ_crop_combined[[x]])))
   mapview::mapview(sp_max)
 }
-# view_sp("casspa")
+view_sp("casspa")
 
 # Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each week stored as a single-layer SpatRaster in a list.
 possible_lifers <- list()
@@ -223,6 +288,15 @@ for (i in 1:52) {
 possible_lifers <- sapply(possible_lifers, terra::project, y = "epsg:5070", method = "near")
 possible_lifers <- sapply(possible_lifers, terra::mask, mask = project(vect(study_area), y = "epsg:5070"))
 possible_lifers <- sapply(possible_lifers, trim)
+
+# Save week date labels before freeing raster stacks
+week_dates <- names(occ_crop_combined[[1]])
+
+# Free large raster stacks now that per-week summaries are built
+if (annotate == FALSE) {
+  rm(occ_combined, occ_crop_combined)
+  gc()
+}
 
 # For each species and each week get point of highest abundance and add to an sf dataframe (for annotations)
 if (annotate == TRUE) {
@@ -286,9 +360,8 @@ legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
-week_plots_possible <- list()
 for (i in 1:length(possible_lifers)) {
-  date <- names(occ_crop_combined[[1]])[i]
+  date <- week_dates[i]
   if (needs_list_to_use == "global") {
     legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " potential lifers")
   }
@@ -327,7 +400,7 @@ for (i in 1:length(possible_lifers)) {
       tag = paste0(format(ymd(date), format = "%b-%d")),
       # subtitle = "Mapping the birds you've yet to meet",
       fill = legend_lab,
-      caption = paste0("Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\nA candidate lifer is considered `possible` if the species has a >", round(possible_occurrence_threshold * 100, 0), "% modeled occurrence probability at the location and date.\n
+      caption = paste0("Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\n\nA candidate lifer is considered `possible` if the species has a >", round(possible_occurrence_threshold * 100, 0), "% modeled occurrence probability at the location and date.\n
 Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, I. Davies, A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2023. eBird Status and Trends, Data Version:\n2022; Released: 2023. Cornell Lab of Ornithology, Ithaca, New York. https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s)\nand do not necessarily reflect the views of the Cornell Lab of Ornithology.")
     ) +
     ggthemes::theme_fivethirtyeight() +
@@ -364,8 +437,11 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
   if (!file.exists(jpg_path)) {
     ggsave(filename = jpg_path, plot = week_plot, bg = "white", height = 5.35, width = 6.6)
   }
-  week_plots_possible[[i]] <- week_plot
+  rm(week_plot)
+  gc()
 }
+rm(possible_lifers)
+gc()
 
 # Generate animated gif (full size and smaller for sharing)
 fps_val <- if (annotate == TRUE) 0.5 else 5
@@ -390,7 +466,14 @@ if (!file.exists(image_path) || !file.exists(image_path_lores)) {
   # Scale down for sharing (from in-memory frames, avoid re-reading the large GIF)
   if (!file.exists(image_path_lores)) {
     lores <- image_scale(img_joined, geometry_size_percent(width = 38, height = NULL))
+    rm(img_joined)
+    gc()
     image_write_gif(lores, path = image_path_lores, delay = 1 / fps_val)
+    rm(lores)
+    gc()
+  } else {
+    rm(img_joined)
+    gc()
   }
 } else {
   message("Animated GIFs already exist, skipping.")

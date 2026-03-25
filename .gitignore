@@ -9,3 +9,6 @@ pushit.sh
 
 # Script output
 Results/
+
+# eBird S&T raster cache (large binary files, project-local)
+data/ebirdst/
