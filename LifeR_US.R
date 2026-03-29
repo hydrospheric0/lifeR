@@ -318,6 +318,9 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
 # Typical speedup vs streaming: ~20–40% at 9km, ~30–50% at 3km.
 # ---------------------------------------------------------------------------
 
+# Convert study_area to a terra SpatVector once; reused throughout.
+study_area_vect <- terra::vect(study_area)
+
 # Probe: load + crop the first valid species to get actual cropped dimensions.
 probe_idx   <- which(vapply(tif_paths, file.exists, logical(1L)))[1L]
 probe_code  <- sp_ebst_for_run$species_code[probe_idx]
