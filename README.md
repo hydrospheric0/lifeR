@@ -4,7 +4,7 @@
 
 This R script was developed by Samuel Safran to generate personal maps of potential lifer birds using ebirdst and terra. See his post here for overview: https://smsfrn.github.io/posts/2024/01/lifer-mapper/
 
-This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR). The original upstream code is preserved unchanged as [`lifeR_original.R`](lifeR_original.R). Changes made in this fork are documented below and in the commit history.
+This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR).
 
 ---
 
@@ -14,10 +14,10 @@ This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR). Th
 |------|-------------|
 | `LifeR_US.R` | Current working version — all improvements applied, US/CONUS |
 | `LifeR_NL.R` | Netherlands adaptation of the same improved script |
-| `lifeR_original.R` | Sam Safran's original upstream code, preserved unchanged as a reference |
-| `LifeR_US_original.R` | Early fork snapshot (pre-memory guards; kept for diff reference) |
+| `lifeR_original_runnable.R` | Sam Safran's original code adapted for unattended runs (magick→gifski, interactive calls removed); useful as a benchmark baseline |
 | `install_packages.R` | Standalone R package installer |
 | `config_local.R.example` | Template for local API key config (copy → `config_local.R`) |
+| `benchmark_compare.sh` | Shell script to time-and-RAM compare original vs current at any resolution |
 
 ---
 
@@ -58,7 +58,8 @@ All changes are relative to [`lifeR_original.R`](lifeR_original.R) (Sam Safran's
 - **Progress messages throughout** — step counts, species totals, and memory/disk status printed at each stage
 
 ### GIF generation
-- **Replaced magick with gifski** — `image_write_gif()` (gifski backend) instead of `image_animate()` + `image_write()`; eliminates an ImageMagick segfault and pixel-cache exhaustion that occurs when assembling large animated GIFs
+- **`magick` replaced by `gifski`** — `image_write_gif()` (gifski backend) instead of `image_animate()` + `image_write()`; eliminates an ImageMagick segfault and pixel-cache exhaustion that occurs when assembling large animated GIFs
+- **`mapview` removed** — interactive call was removed; no longer a dependency
 
 ### New regions
 - **`LifeR_NL.R`** — Netherlands adaptation; uses NL regional checklist and appropriate CRS/boundary

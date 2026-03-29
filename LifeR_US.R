@@ -135,7 +135,8 @@ resolution <- "3km" # "3km", "9km", or "27km"
 if (!is.na(Sys.getenv("BENCH_RESOLUTION", unset = NA))) {
   resolution <- Sys.getenv("BENCH_RESOLUTION")
   message(sprintf("[BENCH] resolution overridden to '%s' by BENCH_RESOLUTION env var", resolution))
-}annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
+}
+annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "dark" # accepted values "light_blue", "dark", "light_green"
 
@@ -514,13 +515,7 @@ message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_r
 bench_checkpoint("after_reproject")
 gc()
 
-# Finalise annotation data frame (polys_list was built per-species in the chunk loop above)
-if (annotate == TRUE) {
-  polys <- do.call("rbind", polys_list) %>%
-    dplyr::left_join(sp_ebst_for_run_in_region, by = c("sp" = "species_code"))
-  polys <- sf::st_filter(polys, study_area)
-  rm(polys_list); gc()
-}
+# polys was already finalised above (after bench_checkpoint("after_accumulation"))
 
 # Generate weekly maps
 # Set theme colors
@@ -605,7 +600,7 @@ for (i in seq_along(possible_lifers)) {
       # subtitle = "Mapping the birds you've yet to meet",
       fill = legend_lab,
       caption = paste0("Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\n\nA candidate lifer is considered `possible` if the species has a >", round(possible_occurrence_threshold * 100, 0), "% modeled occurrence probability at the location and date.\n
-Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, I. Davies, A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2023. eBird Status and Trends, Data Version:\n2022; Released: 2023. Cornell Lab of Ornithology, Ithaca, New York. https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s)\nand do not necessarily reflect the views of the Cornell Lab of Ornithology.")
+Data from 2023 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, C. Davis, M. Stokowski, A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2024. eBird Status and Trends, Data Version:\n2023; Released: 2025. Cornell Lab of Ornithology, Ithaca, New York. https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s)\nand do not necessarily reflect the views of the Cornell Lab of Ornithology.")
     ) +
     ggthemes::theme_fivethirtyeight() +
     theme(

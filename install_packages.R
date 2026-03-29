@@ -22,10 +22,9 @@ cran_pkgs <- c(
   "sf",
   "rnaturalearth",
   "tidyterra",
-  "magick",
-  "mapview",  # requires libharfbuzz-dev/libfribidi-dev; will fail without them
+  "gifski",   # GIF assembly (replaces magick — no ImageMagick dep, no segfault)
+  "png",      # read PNG dimensions for gifski hi-res output
   "ggthemes",
-  "raster",
   "remotes"
 )
 
