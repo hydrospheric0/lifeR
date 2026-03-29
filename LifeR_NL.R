@@ -20,9 +20,59 @@ library(sf)
 library(rnaturalearth)
 #library(rnaturalearthhires)
 library(tidyterra)
-library(magick)
+library(gifski)
+library(png)
 
 here()
+
+# ---------------------------------------------------------------------------
+# Hardware detection and safety helpers (shared with LifeR_US.R)
+# ---------------------------------------------------------------------------
+get_available_ram_gb <- function() {
+  if (file.exists("/proc/meminfo")) {
+    lines <- readLines("/proc/meminfo", warn = FALSE)
+    avail <- grep("MemAvailable", lines, value = TRUE)
+    if (length(avail) > 0)
+      return(as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1", avail[1])) / 1e6)
+  }
+  tryCatch({ as.numeric(system("sysctl -n hw.memsize 2>/dev/null", intern = TRUE)) / 1e9 },
+           error = function(e) NA_real_)
+}
+get_available_disk_gb <- function(path = here()) {
+  tryCatch({
+    df_out <- system(sprintf("df -BG '%s' 2>/dev/null | tail -1", path), intern = TRUE)
+    as.numeric(gsub("G", "", strsplit(trimws(df_out), "\\s+")[[1]][4]))
+  }, error = function(e) NA_real_)
+}
+get_process_rss_gb <- function() {
+  tryCatch({
+    lines <- readLines("/proc/self/status", warn = FALSE)
+    val   <- grep("^VmRSS:", lines, value = TRUE)
+    if (length(val) == 0L) return(NA_real_)
+    as.numeric(gsub("[^0-9]", "", val[1L])) / 1e6
+  }, error = function(e) NA_real_)
+}
+check_memory_pressure <- function(label = "", max_fraction = 0.85) {
+  rss_gb <- get_process_rss_gb()
+  if (is.na(rss_gb)) return(invisible(NULL))
+  total_gb <- as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1",
+    grep("MemTotal", readLines("/proc/meminfo", warn = FALSE), value = TRUE)[1])) / 1e6
+  if (rss_gb > total_gb * max_fraction)
+    stop(sprintf("Memory safety limit at [%s]: %.1f GB / %.1f GB (%.0f%%).",
+                 label, rss_gb, total_gb, rss_gb / total_gb * 100))
+  invisible(rss_gb)
+}
+check_disk_space <- function(min_gb = 2, path = here()) {
+  avail <- get_available_disk_gb(path)
+  if (!is.na(avail) && avail < min_gb)
+    stop(sprintf("Insufficient disk space: %.1f GB available, need %d GB.", avail, min_gb))
+  invisible(avail)
+}
+
+ram_gb  <- get_available_ram_gb()
+disk_gb <- get_available_disk_gb()
+message(sprintf("[hardware] %.0f GB RAM available | %.0f GB disk free",
+  ifelse(is.na(ram_gb), -1, ram_gb), ifelse(is.na(disk_gb), -1, disk_gb)))
 
 # Store S&T rasters in the project folder (data/ebirdst/) rather than the
 # hidden R per-user directory.  Python scripts and R scripts share this path.
@@ -364,6 +414,9 @@ legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
+message(sprintf("Rendering %d weekly maps…", length(possible_lifers)))
+check_disk_space(min_gb = 1)
+t_render <- proc.time()["elapsed"]
 for (i in 1:length(possible_lifers)) {
   date <- week_dates[i]
   if (needs_list_to_use == "global") {
@@ -437,17 +490,23 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
       legend.text.align = 0.5
     )
   week_plot
-  jpg_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".jpg"))
-  if (!file.exists(jpg_path)) {
-    ggsave(filename = jpg_path, plot = week_plot, bg = "white", height = 5.35, width = 6.6)
+  png_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".png"))
+  if (!file.exists(png_path)) {
+    ggsave(filename = png_path, plot = week_plot, bg = "white", width = 1920, height = 1600, units = "px")
   }
   rm(week_plot)
   gc()
 }
+message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_render))
 rm(possible_lifers)
 gc()
 
-# Generate animated gif (full size and smaller for sharing)
+# Generate animated GIFs using gifski (reads PNGs in Rust — no R image objects needed,
+# no ImageMagick pixel-cache exhaustion risk).
+message("Assembling animated GIFs…")
+check_disk_space(min_gb = 1)
+check_memory_pressure("before GIF assembly")
+t_gif <- proc.time()["elapsed"]
 fps_val <- if (annotate == TRUE) 0.5 else 5
 image_path <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
@@ -458,27 +517,35 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
   "_lores_", if (annotate) "annotated_", user_file, ".gif"
 ))
 
-if (!file.exists(image_path) || !file.exists(image_path_lores)) {
-  imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
-  img_joined <- image_join(lapply(imgs, image_read))
+png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
 
-  # Use image_write_gif (gifski backend) to avoid ImageMagick segfault on large GIFs
+if (length(png_frames) > 0) {
+  first_dim <- dim(png::readPNG(png_frames[1]))  # height × width × channels
+  full_w <- first_dim[2]
+  full_h <- first_dim[1]
+
   if (!file.exists(image_path)) {
-    image_write_gif(img_joined, path = image_path, delay = 1 / fps_val)
+    gifski::gifski(png_files = png_frames, gif_file = image_path,
+                   width = full_w, height = full_h,
+                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
+    message(sprintf("  Hi-res GIF: %s (%.1f MB)", basename(image_path),
+                    file.info(image_path)$size / 1e6))
   }
 
-  # Scale down for sharing (from in-memory frames, avoid re-reading the large GIF)
   if (!file.exists(image_path_lores)) {
-    lores <- image_scale(img_joined, geometry_size_percent(width = 38, height = NULL))
-    rm(img_joined)
-    gc()
-    image_write_gif(lores, path = image_path_lores, delay = 1 / fps_val)
-    rm(lores)
-    gc()
-  } else {
-    rm(img_joined)
-    gc()
+    lores_w <- round(full_w * 0.38)
+    lores_h <- round(full_h * 0.38)
+    gifski::gifski(png_files = png_frames, gif_file = image_path_lores,
+                   width = lores_w, height = lores_h,
+                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
+    message(sprintf("  Lo-res GIF: %s (%.1f MB)", basename(image_path_lores),
+                    file.info(image_path_lores)$size / 1e6))
   }
 } else {
+  message("No PNG frames found, skipping GIF assembly.")
+}
+
+if (file.exists(image_path) && file.exists(image_path_lores)) {
   message("Animated GIFs already exist, skipping.")
 }
+message(sprintf("  GIF assembly complete in %.1fs", proc.time()["elapsed"] - t_gif))

@@ -101,12 +101,6 @@ message(sprintf("[hardware] %d physical cores, %d logical | %.0f GB RAM availabl
   ifelse(is.na(disk_gb), -1, disk_gb)))
 message(sprintf("[hardware] Using %d workers for parallel operations", n_workers))
 
-# Configure terra memory management (leave threading at terra defaults)
-terra::terraOptions(
-  memfrac = 0.7,
-  progress = 0L
-)
-
 # Store S&T rasters in the project folder (data/ebirdst/) rather than the
 # hidden R per-user directory.  Python scripts and R scripts share this path.
 # Must be set before any ebirdst function is called.
@@ -120,7 +114,7 @@ user <- "Bart Wickel" # e.g., "Sam Safran" - this is typically your full name or
 user_short <- NA # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
 your_ebird_dat <- here("MyEBirdData.csv") # path to where your personal eBird data are stored
 needs_list_to_use <- "regional" # set to "global" if you want to map true lifers (species you haven't observed anywhere); set to "regional" if you'd like to map needs for the specified region.
-resolution <- "27km" # "3km", "9km", or "27km"
+resolution <- "3km" # "3km", "9km", or "27km"
 annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "dark" # accepted values "light_blue", "dark", "light_green"
@@ -251,25 +245,16 @@ if (length(needs_download) > 0) {
   message("All species data already cached, skipping download.")
 }
 
-# Guard against OOM — resolution-dependent memory estimate.
-# 3km loads ~9x more data than 9km; 27km is lightweight.
-mem_required_gb <- switch(resolution,
-  "3km"  = 150,
-  "9km"  = 20,
-  "27km" = 4,
-  20  # fallback
-)
+# Minimum RAM needed for streaming approach: ~1 species raster at a time.
+# 3km single species ~200 MB; 2 GB headroom is sufficient at any resolution.
+mem_required_gb <- 2
 ram_now <- get_available_ram_gb()
 if (!is.na(ram_now)) {
   if (ram_now < mem_required_gb) {
-    stop(sprintf(paste0(
-      "%s resolution requires ~%d GB RAM.\n",
-      "  Available RAM : %.0f GB\n",
-      "Switch to a coarser resolution, or run on a machine with more RAM."),
-      resolution, mem_required_gb, ram_now))
+    stop(sprintf("Insufficient RAM: %.1f GB available, need at least %d GB.", ram_now, mem_required_gb))
   }
-  message(sprintf("[RAM check] %s: %.0f GB available, ~%d GB needed — proceeding.",
-    resolution, ram_now, mem_required_gb))
+  message(sprintf("[RAM check] %.0f GB available — streaming accumulation, peak ~1 species raster at a time.",
+    ram_now))
 } else {
   message("[RAM check] Could not detect available memory — proceeding with caution.")
 }
@@ -277,7 +262,7 @@ if (!is.na(ram_now)) {
 # Disk space guard: need at least 2 GB for outputs
 check_disk_space(min_gb = 2)
 
-# Load occurrence rasters for all species in species list (skip any that fail to load)
+# Safe raster loader — logs a warning and returns NULL on failure instead of halting.
 load_raster_safe <- function(sp_code, ...) {
   tryCatch(
     load_raster(sp_code, ...),
@@ -286,17 +271,6 @@ load_raster_safe <- function(sp_code, ...) {
       NULL
     }
   )
-}
-message(sprintf("Loading %d species rasters at %s…", nrow(sp_ebst_for_run), resolution))
-t_load <- proc.time()["elapsed"]
-occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster_safe, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
-occ_combined <- Filter(Negate(is.null), occ_combined)
-message(sprintf("  Loaded %d rasters in %.1fs", length(occ_combined), proc.time()["elapsed"] - t_load))
-check_memory_pressure("after raster load")
-
-# Load proportion population rasters for all species in species list
-if (annotate == TRUE) {
-  prop_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "proportion-population", period = "weekly", metric = "median", resolution = resolution)
 }
 
 # Vector data for region (country/state polygons)
@@ -315,97 +289,135 @@ if (!is.na(region_info$state)) {
 if (!region %in% c("US-HI", "US-AK")) {
   study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
 } # if region is US only mapping continental US
-study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
-# if (requireNamespace("mapview", quietly = TRUE)) mapview::mapview(study_area)  # interactive only
+
+# Get CRS from the first cached tif without loading a full raster into memory
+study_area <- st_transform(study_area, terra::crs(terra::rast(tif_paths[1])))
 
 # Define occurrence threshold for when a species is "possible"
 possible_occurrence_threshold <- 0.01 # minimum occurrence probability for a species to be considered "possible" at a given time/location.
 
-# Function used to drop rasters for species that do not meet occ threshold. This is to help save resources by filtering them out and not processing their layers.
-filter_rasters_to_sp_above_threshold <- function(z) {
-  sp_above_occ_threhsold <- sapply(z, minmax) %>%
-    apply(2, max) %>%
-    as.data.frame() %>%
-    rownames_to_column("species_code") %>%
-    rename("max_val" = ".") %>%
-    left_join(sp_ebst_for_run) %>%
-    filter(max_val > possible_occurrence_threshold) %>%
-    pull(species_code)
-  z <- z[names(z) %in% sp_above_occ_threhsold]
-  z
-}
+# Size terra dynamically to whatever is actually available at runtime.
+mem_total_kb <- as.numeric(system("awk '/MemTotal/{print $2}' /proc/meminfo", intern = TRUE))
+mem_avail_kb <- as.numeric(system("awk '/MemAvailable/{print $2}' /proc/meminfo", intern = TRUE))
+memfrac_safe  <- min(0.85, (mem_avail_kb / mem_total_kb) * 0.80)
+nc <- max(1L, parallel::detectCores() - 2L)
+terra::terraOptions(memfrac = memfrac_safe, threads = nc, progress = 0L)
+message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
+  memfrac_safe, memfrac_safe * mem_total_kb / 1e6, mem_total_kb / 1e6, nc))
 
-# Crop and mask rasters (sequential — terra SpatRaster objects cannot cross fork boundaries)
-message(sprintf("Cropping and masking %d rasters…", length(occ_combined)))
-t_crop <- proc.time()["elapsed"]
-study_vect <- terra::vect(study_area)
-occ_crop_combined <- sapply(occ_combined, function(r) terra::mask(terra::crop(r, y = study_vect), mask = study_vect))
-occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-message(sprintf("  Crop+mask complete in %.1fs (%d species kept)", proc.time()["elapsed"] - t_crop, length(occ_crop_combined)))
-check_memory_pressure("after crop+mask")
-rm(study_vect)
-# occ_crop_combined <- sapply(occ_crop_combined, terra::trim)
+# ---------------------------------------------------------------------------
+# Streaming accumulation — process one species at a time.
+# Peak memory = 1 species raster (52-band, ~200 MB at 3km) + accumulator.
+# This replaces the previous batch approach that held all species simultaneously
+# (occ_combined + occ_crop_combined), which required ~40–120 GB at 3km.
+# ---------------------------------------------------------------------------
+study_area_vect    <- terra::vect(study_area)
+possible_lifers    <- NULL   # 52-layer integer accumulator, lazy-init from first species
+week_dates         <- NULL
+sp_codes_in_region <- character(0)   # species that survived threshold filter
 
 if (annotate == TRUE) {
-  prop_crop_combined <- sapply(prop_combined, terra::crop, y = terra::vect(study_area))
-  prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
-  prop_crop_combined <- sapply(prop_crop_combined, terra::mask, mask = terra::vect(study_area))
-  prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
+  polys_list <- list()
 }
 
-# New version of species data frame with only species meeting occ threshold
-sp_ebst_for_run_in_region <- left_join(
-  x = sapply(occ_crop_combined, minmax) %>%
-    apply(2, max) %>%
-    data.frame() %>%
-    rownames_to_column("species_code") %>%
-    rename("max_val" = "."),
-  y = sp_ebst_for_run
-)
-message(sprintf("[4/4] Species exceeding %.0f%% occurrence threshold anywhere in %s: %d  (dropped %d below threshold)",
-  possible_occurrence_threshold * 100, region,
-  nrow(sp_ebst_for_run_in_region), nrow(sp_ebst_for_run) - nrow(sp_ebst_for_run_in_region)))
-
-# Function for viewing summarized species rasters (interactive use only)
-view_sp <- function(x) {
-  sp_max <- (raster::raster(max(occ_crop_combined[[x]])))
-  mapview::mapview(sp_max)
-}
-# view_sp("casspa")  # uncomment for interactive exploration
-
-# Sum number of "possible" species in each cell based on occurrence probability
-# and the defined threshold. Each week stored as a single-layer SpatRaster.
-message("Accumulating weekly lifer counts (52 weeks)…")
+message(sprintf("Streaming accumulation: %d species at %s…", nrow(sp_ebst_for_run), resolution))
 t_accum <- proc.time()["elapsed"]
-possible_lifers <- list()
-for (i in 1:52) {
-  week_slice <- lapply(occ_crop_combined, subset, subset = i)
-  week_slice <- rast(week_slice)
-  week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
-  possible_lifers[[i]] <- sum(week_slice, na.rm = TRUE)
+n_sp_total <- nrow(sp_ebst_for_run)
+for (sp_idx in seq_len(n_sp_total)) {
+  sp_code <- sp_ebst_for_run$species_code[sp_idx]
+  mem_avail_now_gb <- tryCatch(
+    as.numeric(system("awk '/MemAvailable/{print $2}' /proc/meminfo", intern = TRUE)) / 1e6,
+    error = function(e) NA_real_)
+  message(sprintf("  [%d/%d] %s  (%.1f GB free)", sp_idx, n_sp_total, sp_code,
+    ifelse(is.na(mem_avail_now_gb), -1, mem_avail_now_gb)))
+
+  r <- load_raster_safe(sp_code, product = "occurrence", period = "weekly",
+                        metric = "median", resolution = resolution)
+  if (is.null(r)) next
+
+  r <- terra::crop(r, study_area_vect)
+  r <- terra::mask(r, study_area_vect)
+
+  # Drop species that never exceed threshold anywhere in the region
+  if (max(terra::minmax(r)) <= possible_occurrence_threshold) { rm(r); gc(); next }
+
+  sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+  if (is.null(week_dates)) week_dates <- names(r)
+
+  # Threshold: binary indicator per week
+  r_ind <- terra::ifel(r > possible_occurrence_threshold, 1L, 0L)
+  rm(r); gc()
+
+  # Accumulate: lazy-init then add
+  if (is.null(possible_lifers)) {
+    possible_lifers <- r_ind
+  } else {
+    possible_lifers <- possible_lifers + r_ind
+  }
+  rm(r_ind); gc()
+
+  # Annotation: load proportion-population raster, extract peak cell per week
+  if (annotate == TRUE) {
+    p <- tryCatch(
+      load_raster(sp_code, product = "proportion-population", period = "weekly",
+                  metric = "median", resolution = resolution),
+      error = function(e) NULL)
+    if (!is.null(p)) {
+      p <- terra::crop(p, study_area_vect)
+      p <- terra::mask(p, study_area_vect)
+      if (max(terra::minmax(p)) > possible_occurrence_threshold) {
+        max_val_cells <- terra::where.max(p, values = TRUE, list = FALSE) %>%
+          as.data.frame() %>%
+          dplyr::filter(value > 0)
+        if (nrow(max_val_cells) > 0) {
+          max_val_coords <- terra::xyFromCell(p, max_val_cells[, 2])
+          polys_list[[sp_code]] <- sf::st_as_sf(
+            data.frame(
+              x   = max_val_coords[, 1],
+              y   = max_val_coords[, 2],
+              week = max_val_cells[, 1],
+              sp  = sp_code,
+              max_weekly_proportion = max_val_cells[, 3]),
+            coords = c("x", "y"), crs = terra::crs(p))
+        }
+      }
+      rm(p); gc()
+    }
+  }
 }
 check_memory_pressure("after accumulation")
-message(sprintf("  Accumulation complete in %.1fs", proc.time()["elapsed"] - t_accum))
+message(sprintf("  Accumulation complete in %.1fs (%d species in region)",
+  proc.time()["elapsed"] - t_accum, length(sp_codes_in_region)))
 
-# Reproject, mask, and trim weekly lifer count rasters
+# Convert 52-layer accumulator to a plain list (one SpatRaster per week)
+possible_lifers <- lapply(seq_len(terra::nlyr(possible_lifers)),
+                          function(i) terra::subset(possible_lifers, i))
+
+# New version of species data frame with only species meeting occ threshold
+sp_ebst_for_run_in_region <- sp_ebst_for_run %>%
+  dplyr::filter(species_code %in% sp_codes_in_region)
+message(sprintf("[4/4] Species exceeding %.0f%% occurrence threshold in %s: %d  (dropped %d below threshold)",
+  possible_occurrence_threshold * 100, region,
+  length(sp_codes_in_region), nrow(sp_ebst_for_run) - length(sp_codes_in_region)))
+
+if (annotate == TRUE) {
+  polys <- do.call("rbind", polys_list) %>%
+    dplyr::left_join(sp_ebst_for_run_in_region, by = c("sp" = "species_code"))
+  polys <- sf::st_filter(polys, study_area)
+  rm(polys_list); gc()
+}
+
+# Reproject, mask, and trim weekly lifer count rasters for plotting
 message("Reprojecting 52 weekly rasters…")
 t_reproj <- proc.time()["elapsed"]
-study_area_5070 <- project(vect(study_area), y = "epsg:5070")
+study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
 possible_lifers <- lapply(possible_lifers, function(r) {
   r <- terra::project(r, y = "epsg:5070", method = "near")
   r <- terra::mask(r, mask = study_area_5070)
-  trim(r)
+  terra::trim(r)
 })
 message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
-
-# Save week date labels before freeing raster stacks
-week_dates <- names(occ_crop_combined[[1]])
-
-# Free large raster stacks now that per-week summaries are built
-if (annotate == FALSE) {
-  rm(occ_combined, occ_crop_combined)
-  gc()
-}
+gc()
 
 # For each species and each week get point of highest abundance and add to an sf dataframe (for annotations)
 if (annotate == TRUE) {
