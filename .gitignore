@@ -15,7 +15,6 @@ ne_admin1_large.rds
 
 # Benchmark artefacts
 benchmark.sh
-BENCHMARK_RESULTS.md
 benchmark_results/
 
 # Intermediate/archived script versions
