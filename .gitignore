@@ -21,6 +21,10 @@ benchmark_results/
 # Intermediate/archived script versions
 LifeR_US_original.R
 
+# eBird taxonomy export and supporting scripts
+ebirdst_runs.csv
+export_ebirdst_runs.R
+
 # eBird S&T raster cache (large binary files, project-local)
 data/ebirdst/
 data/
