@@ -4,7 +4,7 @@
 .libPaths(c(path.expand("~/R/library"), .libPaths()))
 
 # ---------------------------------------------------------------------------
-# Benchmark helpers — emit [BENCH] lines consumed by benchmark_compare.sh
+# Benchmark helpers  -  emit [BENCH] lines consumed by benchmark_compare.sh
 # ---------------------------------------------------------------------------
 .bench_t0 <- proc.time()["elapsed"]
 bench_checkpoint <- function(label) {
@@ -140,7 +140,7 @@ annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "dark" # accepted values "light_blue", "dark", "light_green"
 
-# API keys — loaded from config_local.R (gitignored, never committed).
+# API keys  -  loaded from config_local.R (gitignored, never committed).
 # To set up your own keys:
 #   1. eBird Status & Trends key: request at https://ebird.org/st/request
 #   2. eBird API key: request at https://ebird.org/api/keygen
@@ -275,21 +275,21 @@ if (!is.na(ram_now)) {
   if (ram_now < mem_required_gb) {
     stop(sprintf("Insufficient RAM: %.1f GB available, need at least %d GB.", ram_now, mem_required_gb))
   }
-  message(sprintf("[RAM check] %.0f GB available — streaming accumulation, peak ~1 species raster at a time.",
+  message(sprintf("[RAM check] %.0f GB available  -  streaming accumulation, peak ~1 species raster at a time.",
     ram_now))
 } else {
-  message("[RAM check] Could not detect available memory — proceeding with caution.")
+  message("[RAM check] Could not detect available memory  -  proceeding with caution.")
 }
 
 # Disk space guard: need at least 2 GB for outputs
 check_disk_space(min_gb = 2)
 
-# Safe raster loader — logs a warning and returns NULL on failure instead of halting.
+# Safe raster loader  -  logs a warning and returns NULL on failure instead of halting.
 load_raster_safe <- function(sp_code, ...) {
   tryCatch(
     load_raster(sp_code, ...),
     error = function(e) {
-      message("Skipping ", sp_code, " — could not load raster: ", conditionMessage(e))
+      message("Skipping ", sp_code, "  -  could not load raster: ", conditionMessage(e))
       NULL
     }
   )
@@ -328,16 +328,16 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
   memfrac_safe, memfrac_safe * mem_total_kb / 1e6, mem_total_kb / 1e6, nc))
 
 # ---------------------------------------------------------------------------
-# Auto-sized chunked accumulation — adapts to available RAM at runtime.
+# Auto-sized chunked accumulation  -  adapts to available RAM at runtime.
 #
-# chunk_size=1   → streaming: 1 species at a time, minimum RAM, any machine.
-# chunk_size=N   → batch N species per round: faster via vectorised terra sum.
-# chunk_size=all → full batch (original approach): maximum speed, maximum RAM.
+# chunk_size=1   -> streaming: 1 species at a time, minimum RAM, any machine.
+# chunk_size=N   -> batch N species per round: faster via vectorised terra sum.
+# chunk_size=all -> full batch (original approach): maximum speed, maximum RAM.
 #
 # The speedup from larger chunks comes from terra's vectorised C++ sum:
-#   terra::app(n_species_stack, sum)  — one pass regardless of n_species.
+#   terra::app(n_species_stack, sum)   -  one pass regardless of n_species.
 # Streaming does N separate + operations; batch does one. Disk I/O is identical.
-# Typical speedup vs streaming: ~20–40% at 9km, ~30–50% at 3km.
+# Typical speedup vs streaming: ~20-40% at 9km, ~30-50% at 3km.
 # ---------------------------------------------------------------------------
 
 # Convert study_area to a terra SpatVector once; reused for the probe.
@@ -358,7 +358,7 @@ sp_size_gb <- if (!is.null(r_probe)) {
 } else 0.5   # conservative fallback
 
 if (!is.null(r_probe)) {
-  message(sprintf("  Cropped species raster: %d cells × %d weeks = %.0f MB (float32)",
+  message(sprintf("  Cropped species raster: %d cells x %d weeks = %.0f MB (float32)",
     terra::ncell(r_probe), terra::nlyr(r_probe), sp_size_gb * 1000))
 }
 rm(r_probe); gc()
@@ -368,10 +368,10 @@ avail_gb_now <- tryCatch(
   error = function(e) NA_real_)
 
 chunk_size <- if (!is.na(avail_gb_now)) {
-  # Budget: 40% of free RAM; factor ×3 for raw raster + indicator copy + accumulator delta
+  # Budget: 40% of free RAM; factor x3 for raw raster + indicator copy + accumulator delta
   cs <- max(1L, floor(avail_gb_now * 0.40 / (sp_size_gb * 3)))
   min(cs, nrow(sp_ebst_for_run))
-} else 1L   # can't detect RAM → safe streaming default
+} else 1L   # can't detect RAM -> safe streaming default
 
 message(sprintf(
   "  [chunk] chunk_size=%d  RAM mode: %s",
@@ -389,17 +389,17 @@ if (annotate == TRUE) polys_list <- list()
 sp_chunks <- split(seq_len(nrow(sp_ebst_for_run)),
                    ceiling(seq_len(nrow(sp_ebst_for_run)) / chunk_size))
 
-message(sprintf("Accumulating %d species in %d chunk(s) at %s…",
+message(sprintf("Accumulating %d species in %d chunk(s) at %s...",
   nrow(sp_ebst_for_run), length(sp_chunks), resolution))
 t_accum <- proc.time()["elapsed"]
 
 for (chunk_i in seq_along(sp_chunks)) {
-  # Recreate SpatVector each chunk — terra may invalidate the backing after gc().
+  # Recreate SpatVector each chunk  -  terra may invalidate the backing after gc().
   study_area_vect <- terra::vect(study_area)
 
   idx_range <- sp_chunks[[chunk_i]]
   if (length(sp_chunks) > 1L)
-    message(sprintf("  Chunk %d/%d — species %d–%d of %d",
+    message(sprintf("  Chunk %d/%d  -  species %d-%d of %d",
       chunk_i, length(sp_chunks), min(idx_range), max(idx_range), nrow(sp_ebst_for_run)))
 
   chunk_rasters <- list()
@@ -431,7 +431,7 @@ for (chunk_i in seq_along(sp_chunks)) {
     chunk_rasters[[sp_code]] <- terra::ifel(r > possible_occurrence_threshold, 1L, 0L)
     rm(r); gc()
 
-    # Annotation: per-species — cannot be chunked
+    # Annotation: per-species  -  cannot be chunked
     if (annotate == TRUE) {
       p <- tryCatch(
         load_raster(sp_code, product = "proportion-population", period = "weekly",
@@ -471,7 +471,7 @@ for (chunk_i in seq_along(sp_chunks)) {
   for (wk in seq_len(n_wk)) {
     wk_layers <- terra::rast(lapply(chunk_rasters, terra::subset, subset = wk))
     wk_sum <- if (terra::nlyr(wk_layers) == 1L) {
-      wk_layers            # trivial single-species case — skip app() overhead
+      wk_layers            # trivial single-species case  -  skip app() overhead
     } else {
       terra::app(wk_layers, fun = sum, na.rm = TRUE)
     }
@@ -503,7 +503,7 @@ if (annotate == TRUE) {
 }
 
 # Reproject, mask, and trim weekly lifer count rasters for plotting
-message("Reprojecting 52 weekly rasters…")
+message("Reprojecting 52 weekly rasters...")
 t_reproj <- proc.time()["elapsed"]
 study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
 possible_lifers <- lapply(possible_lifers, function(r) {
@@ -554,7 +554,7 @@ legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
 # Rendering stays sequential because ggplot + ggsave use terra SpatRasters internally.
-message(sprintf("Rendering %d weekly maps…", length(possible_lifers)))
+message(sprintf("Rendering %d weekly maps...", length(possible_lifers)))
 t_render <- proc.time()["elapsed"]
 check_disk_space(min_gb = 1)
 for (i in seq_along(possible_lifers)) {
@@ -642,7 +642,7 @@ rm(possible_lifers)
 gc()
 
 # Generate animated gif (full size and smaller for sharing)
-message("Assembling animated GIFs…")
+message("Assembling animated GIFs...")
 check_disk_space(min_gb = 1)
 check_memory_pressure("before GIF assembly")
 t_gif <- proc.time()["elapsed"]
@@ -656,12 +656,12 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
   "_lores_", if (annotate) "annotated_", user_file, ".gif"
 ))
 
-# gifski reads PNGs directly in Rust — no R image objects needed.
+# gifski reads PNGs directly in Rust  -  no R image objects needed.
 png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
 
 if (length(png_frames) > 0) {
   # Read actual pixel dimensions from the first frame
-  first_dim <- dim(png::readPNG(png_frames[1]))  # height × width × channels
+  first_dim <- dim(png::readPNG(png_frames[1]))  # height x width x channels
   full_w <- first_dim[2]
   full_h <- first_dim[1]
 

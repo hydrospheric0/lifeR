@@ -1,13 +1,13 @@
-# Sam Safran's original LifeR script — adapted minimally for non-interactive benchmarking.
+# Sam Safran's original LifeR script  -  adapted minimally for non-interactive benchmarking.
 #
 # Changes from LifeR_US_original.R (all marked BENCH-MOD):
-#   1. library(magick) replaced with library(gifski) + library(png) — magick segfaults on large GIFs
-#   2. mapview::mapview(study_area) call removed — blocks non-interactive session
-#   3. view_sp("casspa") call removed — interactive + requires raster package
-#   4. GIF assembly replaces magick pipeline with gifski (JPG→PNG conversion in tempdir)
+#   1. library(magick) replaced with library(gifski) + library(png)  -  magick segfaults on large GIFs
+#   2. mapview::mapview(study_area) call removed  -  blocks non-interactive session
+#   3. view_sp("casspa") call removed  -  interactive + requires raster package
+#   4. GIF assembly replaces magick pipeline with gifski (JPG->PNG conversion in tempdir)
 #   5. Timing/RAM checkpoints added throughout for benchmarking
 #
-# Core accumulation logic (batch sapply load → crop → mask → week loop) is UNCHANGED.
+# Core accumulation logic (batch sapply load -> crop -> mask -> week loop) is UNCHANGED.
 
 # Ensure user library is on the path (packages installed via install_packages.R)
 .libPaths(c(path.expand("~/R/library"), .libPaths()))
@@ -183,7 +183,7 @@ load_raster_safe <- function(sp_code, ...) {
     message("Skipping ", sp_code, ": ", conditionMessage(e)); NULL })
 }
 
-message("Loading all occurrence rasters (batch) …")
+message("Loading all occurrence rasters (batch) ...")
 occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster_safe,
   product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
 occ_combined <- Filter(Negate(is.null), occ_combined)
@@ -206,7 +206,7 @@ if (!region %in% c("US-HI", "US-AK")) {
   study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
 }
 study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
-# BENCH-MOD: mapview::mapview(study_area) removed — interactive
+# BENCH-MOD: mapview::mapview(study_area) removed  -  interactive
 
 possible_occurrence_threshold <- 0.01
 
@@ -223,7 +223,7 @@ filter_rasters_to_sp_above_threshold <- function(z) {
   z[names(z) %in% sp_above]
 }
 
-message("Cropping and masking to study area …")
+message("Cropping and masking to study area ...")
 occ_crop_combined <- sapply(occ_combined, terra::crop, y = terra::vect(study_area))
 occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined)
 occ_crop_combined <- sapply(occ_crop_combined, terra::mask, mask = terra::vect(study_area))
@@ -240,10 +240,10 @@ sp_ebst_for_run_in_region <- left_join(
   y = sp_ebst_for_run)
 message(sprintf("[4/4] Species above threshold in %s: %d", region, nrow(sp_ebst_for_run_in_region)))
 
-# BENCH-MOD: view_sp("casspa") removed — interactive + requires raster package
+# BENCH-MOD: view_sp("casspa") removed  -  interactive + requires raster package
 
 # ── ORIGINAL WEEK ACCUMULATION LOOP (unchanged) ────────────────────────────────
-message("Accumulating weekly lifer counts …")
+message("Accumulating weekly lifer counts ...")
 possible_lifers <- list()
 for (i in 1:52) {
   week_slice <- lapply(occ_crop_combined, subset, subset = i)
@@ -286,7 +286,7 @@ labels <- function(x) {
 legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
-message("Rendering weekly frames …")
+message("Rendering weekly frames ...")
 for (i in seq_along(possible_lifers)) {
   date <- week_dates[i]
   legend_lab <- paste0(ifelse(is.na(user_short), "My", paste0(user_short, "'s")),
@@ -343,16 +343,16 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
 png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
 
 if (length(png_frames) > 0) {
-  first_dim <- dim(png::readPNG(png_frames[1]))   # height × width × channels
+  first_dim <- dim(png::readPNG(png_frames[1]))   # height x width x channels
   frame_h <- first_dim[1]; frame_w <- first_dim[2]
 
   if (!file.exists(image_path)) {
-    message("Building hi-res GIF …")
+    message("Building hi-res GIF ...")
     gifski::gifski(png_files = png_frames, gif_file = image_path,
       width = frame_w, height = frame_h, delay = 1 / fps_val, progress = FALSE)
   }
   if (!file.exists(image_path_lores)) {
-    message("Building lo-res GIF …")
+    message("Building lo-res GIF ...")
     gifski::gifski(png_files = png_frames, gif_file = image_path_lores,
       width = round(frame_w * 0.38), height = round(frame_h * 0.38),
       delay = 1 / fps_val, progress = FALSE)

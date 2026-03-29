@@ -92,7 +92,7 @@ annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "dark" # accepted values "light_blue", "dark", "light_green"
 
-# API keys — loaded from config_local.R (gitignored, never committed).
+# API keys  -  loaded from config_local.R (gitignored, never committed).
 # To set up your own keys:
 #   1. eBird Status & Trends key: request at https://ebird.org/st/request
 #   2. eBird API key: request at https://ebird.org/api/keygen
@@ -223,7 +223,7 @@ load_raster_safe <- function(sp_code, ...) {
   tryCatch(
     load_raster(sp_code, ...),
     error = function(e) {
-      message("Skipping ", sp_code, " — could not load raster: ", conditionMessage(e))
+      message("Skipping ", sp_code, "  -  could not load raster: ", conditionMessage(e))
       NULL
     }
   )
@@ -270,7 +270,7 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
                 nc))
 
 # Process one species at a time to keep peak memory low:
-# load → crop → mask → threshold → accumulate weekly counts → free.
+# load -> crop -> mask -> threshold -> accumulate weekly counts -> free.
 # Only the 52-layer count accumulator and (optionally) one species raster
 # are live at once, rather than all species simultaneously.
 study_area_vect <- terra::vect(study_area)
@@ -414,7 +414,7 @@ legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
-message(sprintf("Rendering %d weekly maps…", length(possible_lifers)))
+message(sprintf("Rendering %d weekly maps...", length(possible_lifers)))
 check_disk_space(min_gb = 1)
 t_render <- proc.time()["elapsed"]
 for (i in 1:length(possible_lifers)) {
@@ -501,9 +501,9 @@ message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_rend
 rm(possible_lifers)
 gc()
 
-# Generate animated GIFs using gifski (reads PNGs in Rust — no R image objects needed,
+# Generate animated GIFs using gifski (reads PNGs in Rust  -  no R image objects needed,
 # no ImageMagick pixel-cache exhaustion risk).
-message("Assembling animated GIFs…")
+message("Assembling animated GIFs...")
 check_disk_space(min_gb = 1)
 check_memory_pressure("before GIF assembly")
 t_gif <- proc.time()["elapsed"]
@@ -520,7 +520,7 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
 png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
 
 if (length(png_frames) > 0) {
-  first_dim <- dim(png::readPNG(png_frames[1]))  # height × width × channels
+  first_dim <- dim(png::readPNG(png_frames[1]))  # height x width x channels
   full_w <- first_dim[2]
   full_h <- first_dim[1]
 
