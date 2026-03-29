@@ -328,16 +328,18 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
   memfrac_safe, memfrac_safe * mem_total_kb / 1e6, mem_total_kb / 1e6, nc))
 
 # ---------------------------------------------------------------------------
-# Auto-sized chunked accumulation  -  adapts to available RAM at runtime.
+# Matrix accumulation  -  avoids 29,000 terra object operations.
 #
-# chunk_size=1   -> streaming: 1 species at a time, minimum RAM, any machine.
-# chunk_size=N   -> batch N species per round: faster via vectorised terra sum.
-# chunk_size=all -> full batch (original approach): maximum speed, maximum RAM.
+# Strategy:
+#   1. Crop + mask each species raster with terra (unavoidable).
+#   2. Immediately call terra::values() to extract a raw integer matrix
+#      (n_cells x 52).  NA outside boundary = 0 for accumulation.
+#   3. Add to one integer accumulator matrix  -  plain R + over n_cells x 52.
+#   4. After all species: wrap each of 52 columns back into a SpatRaster
+#      (cost: 52 terra::setValues() calls, not 561 x 52 terra ops).
 #
-# The speedup from larger chunks comes from terra's vectorised C++ sum:
-#   terra::app(n_species_stack, sum)   -  one pass regardless of n_species.
-# Streaming does N separate + operations; batch does one. Disk I/O is identical.
-# Typical speedup vs streaming: ~20-40% at 9km, ~30-50% at 3km.
+# chunk_size controls gc() cadence only  -  no longer affects sum strategy.
+# chunk_size=1 -> gc() every species; larger -> gc() every N species.
 # ---------------------------------------------------------------------------
 
 # Convert study_area to a terra SpatVector once; reused for the probe.
@@ -353,138 +355,123 @@ r_probe <- tryCatch({
   if (!is.null(rr)) terra::crop(rr, study_area_vect) else NULL
 }, error = function(e) NULL)
 
-sp_size_gb <- if (!is.null(r_probe)) {
-  (terra::ncell(r_probe) * terra::nlyr(r_probe) * 4L) / 1e9   # float32
-} else 0.5   # conservative fallback
+n_cells_probe <- if (!is.null(r_probe)) terra::ncell(r_probe) else NA_integer_
+n_weeks        <- if (!is.null(r_probe)) terra::nlyr(r_probe)  else 52L
+sp_size_gb     <- if (!is.null(r_probe)) {
+  (n_cells_probe * n_weeks * 4L) / 1e9   # float32
+} else 0.5
 
 if (!is.null(r_probe)) {
   message(sprintf("  Cropped species raster: %d cells x %d weeks = %.0f MB (float32)",
-    terra::ncell(r_probe), terra::nlyr(r_probe), sp_size_gb * 1000))
+    n_cells_probe, n_weeks, sp_size_gb * 1000))
 }
-rm(r_probe); gc()
 
+# Keep the probe as the spatial template for wrapping results back into a raster
+# at the end.  Set all values to 0 so we have a clean geometry shell.
+raster_template <- r_probe
+if (!is.null(raster_template)) terra::values(raster_template) <- 0L
+rm(r_probe)
+
+# gc() cadence: every ~gc_every species.  Larger = fewer gc() calls = faster;
+# smaller = lower peak RAM.  ~50 is a good balance at any resolution.
 avail_gb_now <- tryCatch(
   as.numeric(system("awk '/MemAvailable/{print $2}' /proc/meminfo", intern = TRUE)) / 1e6,
   error = function(e) NA_real_)
+gc_every <- if (!is.na(avail_gb_now)) {
+  max(10L, min(100L, as.integer(avail_gb_now * 0.40 / (sp_size_gb * 2))))
+} else 50L
+message(sprintf("  gc() every %d species  (%.0f GB free)",
+  gc_every, ifelse(is.na(avail_gb_now), -1, avail_gb_now)))
 
-chunk_size <- if (!is.na(avail_gb_now)) {
-  # Budget: 40% of free RAM; factor x3 for raw raster + indicator copy + accumulator delta
-  cs <- max(1L, floor(avail_gb_now * 0.40 / (sp_size_gb * 3)))
-  min(cs, nrow(sp_ebst_for_run))
-} else 1L   # can't detect RAM -> safe streaming default
-
-message(sprintf(
-  "  [chunk] chunk_size=%d  RAM mode: %s",
-  chunk_size,
-  if (chunk_size >= nrow(sp_ebst_for_run)) "full batch (all species in RAM)"
-  else if (chunk_size == 1L) "streaming (min RAM)"
-  else sprintf("chunked (~%.0f GB per chunk)", chunk_size * sp_size_gb * 3)))
-
-# Pre-allocate output structure: one SpatRaster per week, lazy-init below.
-possible_lifers    <- vector("list", 52L)
-week_dates         <- NULL
+# Pre-allocate the integer accumulator matrix: n_cells x 52.
+# NA outside the boundary is handled by treating NA values as 0 during accumulation.
+accum          <- NULL   # lazy-init on first valid species (need actual n_cells)
+week_dates     <- NULL
 sp_codes_in_region <- character(0)
 if (annotate == TRUE) polys_list <- list()
 
-sp_chunks <- split(seq_len(nrow(sp_ebst_for_run)),
-                   ceiling(seq_len(nrow(sp_ebst_for_run)) / chunk_size))
-
-message(sprintf("Accumulating %d species in %d chunk(s) at %s...",
-  nrow(sp_ebst_for_run), length(sp_chunks), resolution))
+message(sprintf("Accumulating %d species at %s (matrix mode)...",
+  nrow(sp_ebst_for_run), resolution))
 t_accum <- proc.time()["elapsed"]
 
-for (chunk_i in seq_along(sp_chunks)) {
-  # Recreate SpatVector each chunk  -  terra may invalidate the backing after gc().
-  study_area_vect <- terra::vect(study_area)
+for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
+  # Recreate SpatVector periodically to guard against terra gc() invalidation.
+  if (sp_idx %% gc_every == 1L) study_area_vect <- terra::vect(study_area)
 
-  idx_range <- sp_chunks[[chunk_i]]
-  if (length(sp_chunks) > 1L)
-    message(sprintf("  Chunk %d/%d  -  species %d-%d of %d",
-      chunk_i, length(sp_chunks), min(idx_range), max(idx_range), nrow(sp_ebst_for_run)))
+  sp_code <- sp_ebst_for_run$species_code[sp_idx]
 
-  chunk_rasters <- list()
+  r <- load_raster_safe(sp_code, product = "occurrence", period = "weekly",
+                        metric = "median", resolution = resolution)
+  if (is.null(r)) next
 
-  for (sp_idx in idx_range) {
-    sp_code <- sp_ebst_for_run$species_code[sp_idx]
+  r <- terra::crop(r, study_area_vect)
+  r <- terra::mask(r, study_area_vect)
+  if (max(terra::minmax(r)) <= possible_occurrence_threshold) { rm(r); gc(); next }
 
-    # Per-species RAM report only in streaming mode (chunk_size=1)
-    if (chunk_size == 1L) {
-      mem_now <- tryCatch(
-        as.numeric(system("awk '/MemAvailable/{print $2}' /proc/meminfo", intern = TRUE)) / 1e6,
-        error = function(e) NA_real_)
-      message(sprintf("    [%d/%d] %s  (%.1f GB free)",
-        sp_idx, nrow(sp_ebst_for_run), sp_code, ifelse(is.na(mem_now), -1, mem_now)))
-    }
+  sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+  if (is.null(week_dates)) week_dates <- names(r)
 
-    r <- load_raster_safe(sp_code, product = "occurrence", period = "weekly",
-                          metric = "median", resolution = resolution)
-    if (is.null(r)) next
+  # Extract to raw matrix and threshold  -  NA (outside mask) becomes 0
+  vals <- terra::values(r)              # n_cells x 52 numeric matrix
+  rm(r)
+  indicator <- (vals > possible_occurrence_threshold)
+  indicator[is.na(indicator)] <- FALSE
+  storage.mode(indicator) <- "integer"  # 0/1 integer, not logical
+  rm(vals)
 
-    r <- terra::crop(r, study_area_vect)
-    r <- terra::mask(r, study_area_vect)
-    if (max(terra::minmax(r)) <= possible_occurrence_threshold) { rm(r); gc(); next }
+  # Lazy-init accumulator on first valid species
+  if (is.null(accum)) {
+    accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
+  }
+  accum <- accum + indicator
+  rm(indicator)
 
-    sp_codes_in_region <- c(sp_codes_in_region, sp_code)
-    if (is.null(week_dates)) week_dates <- names(r)
+  # gc() every gc_every species to keep peak RAM bounded
+  if (sp_idx %% gc_every == 0L) gc()
 
-    # Threshold to 0/1 indicator and store in chunk
-    chunk_rasters[[sp_code]] <- terra::ifel(r > possible_occurrence_threshold, 1L, 0L)
-    rm(r); gc()
-
-    # Annotation: per-species  -  cannot be chunked
-    if (annotate == TRUE) {
-      p <- tryCatch(
-        load_raster(sp_code, product = "proportion-population", period = "weekly",
-                    metric = "median", resolution = resolution),
-        error = function(e) NULL)
-      if (!is.null(p)) {
-        p <- terra::crop(p, study_area_vect)
-        p <- terra::mask(p, study_area_vect)
-        if (max(terra::minmax(p)) > possible_occurrence_threshold) {
-          max_val_cells <- terra::where.max(p, values = TRUE, list = FALSE) %>%
-            as.data.frame() %>%
-            dplyr::filter(value > 0)
-          if (nrow(max_val_cells) > 0) {
-            max_val_coords <- terra::xyFromCell(p, max_val_cells[, 2])
-            polys_list[[sp_code]] <- sf::st_as_sf(
-              data.frame(
-                x   = max_val_coords[, 1],
-                y   = max_val_coords[, 2],
-                week = max_val_cells[, 1],
-                sp  = sp_code,
-                max_weekly_proportion = max_val_cells[, 3]),
-              coords = c("x", "y"), crs = terra::crs(p))
-          }
+  # Annotation: per-species  -  unchanged
+  if (annotate == TRUE) {
+    p <- tryCatch(
+      load_raster(sp_code, product = "proportion-population", period = "weekly",
+                  metric = "median", resolution = resolution),
+      error = function(e) NULL)
+    if (!is.null(p)) {
+      p <- terra::crop(p, study_area_vect)
+      p <- terra::mask(p, study_area_vect)
+      if (max(terra::minmax(p)) > possible_occurrence_threshold) {
+        max_val_cells <- terra::where.max(p, values = TRUE, list = FALSE) %>%
+          as.data.frame() %>%
+          dplyr::filter(value > 0)
+        if (nrow(max_val_cells) > 0) {
+          max_val_coords <- terra::xyFromCell(p, max_val_cells[, 2])
+          polys_list[[sp_code]] <- sf::st_as_sf(
+            data.frame(
+              x   = max_val_coords[, 1],
+              y   = max_val_coords[, 2],
+              week = max_val_cells[, 1],
+              sp  = sp_code,
+              max_weekly_proportion = max_val_cells[, 3]),
+            coords = c("x", "y"), crs = terra::crs(p))
         }
-        rm(p); gc()
       }
+      rm(p); gc()
     }
   }
+}
+gc()
 
-  if (length(chunk_rasters) == 0L) next
-
-  # --- Vectorised week summation across all species in this chunk -----------
-  # For each of 52 weeks, stack the week-i layer from every species in the
-  # chunk and call terra::app(sum). terra's C++ runs this in one pass.
-  # With chunk_size=1 there is only one layer so app() reduces to a copy.
-  n_wk <- terra::nlyr(chunk_rasters[[1L]])
-  for (wk in seq_len(n_wk)) {
-    wk_layers <- terra::rast(lapply(chunk_rasters, terra::subset, subset = wk))
-    wk_sum <- if (terra::nlyr(wk_layers) == 1L) {
-      wk_layers            # trivial single-species case  -  skip app() overhead
-    } else {
-      terra::app(wk_layers, fun = sum, na.rm = TRUE)
-    }
-    rm(wk_layers)
-    possible_lifers[[wk]] <- if (is.null(possible_lifers[[wk]])) {
-      wk_sum
-    } else {
-      possible_lifers[[wk]] + wk_sum
-    }
-    rm(wk_sum)
+# Wrap the 52-column accumulator back into one SpatRaster per week.
+# Cost: 52 terra::setValues() calls  -  trivial vs 561 x 52 terra ops before.
+possible_lifers <- vector("list", n_weeks)
+if (!is.null(accum) && !is.null(raster_template)) {
+  for (wk in seq_len(n_weeks)) {
+    r_wk <- raster_template
+    terra::values(r_wk) <- accum[, wk]
+    possible_lifers[[wk]] <- r_wk
   }
-  rm(chunk_rasters); gc()
-  check_memory_pressure(sprintf("after chunk %d/%d", chunk_i, length(sp_chunks)))
+  rm(accum, raster_template)
+} else {
+  stop("Accumulation produced no valid rasters - check that species tifs exist and region/resolution are correct.")
 }
 
 # New version of species data frame with only species meeting occ threshold
