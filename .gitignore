@@ -14,7 +14,12 @@ Results/
 ne_admin1_large.rds
 
 # Benchmark artefacts
+benchmark.sh
+BENCHMARK_RESULTS.md
 benchmark_results/
+
+# Intermediate/archived script versions
+LifeR_US_original.R
 
 # eBird S&T raster cache (large binary files, project-local)
 data/ebirdst/
