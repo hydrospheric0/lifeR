@@ -647,36 +647,49 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
 png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
 
 if (length(png_frames) > 0) {
-  # Read actual pixel dimensions from the first frame
-  first_dim <- dim(png::readPNG(png_frames[1]))  # height x width x channels
-  full_w <- first_dim[2]
-  full_h <- first_dim[1]
+  both_exist <- file.exists(image_path) && file.exists(image_path_lores)
+  if (both_exist) {
+    message("  Animated GIFs already exist, skipping.")
+  } else {
+    # Read actual pixel dimensions from the first frame
+    first_dim <- dim(png::readPNG(png_frames[1]))  # height x width x channels
+    full_w <- first_dim[2]
+    full_h <- first_dim[1]
 
-  # Hi-res: pass native frame dimensions so gifski doesn't downscale
-  if (!file.exists(image_path)) {
-    gifski::gifski(png_files = png_frames, gif_file = image_path,
-                   width = full_w, height = full_h,
-                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
-    message(sprintf("  Hi-res GIF: %s (%.1f MB)", basename(image_path),
-                    file.info(image_path)$size / 1e6))
-  }
+    # Hi-res: pass native frame dimensions so gifski doesn't downscale
+    if (!file.exists(image_path)) {
+      tryCatch({
+        gifski::gifski(png_files = png_frames, gif_file = image_path,
+                       width = full_w, height = full_h,
+                       delay = 1 / fps_val, loop = TRUE, progress = TRUE)
+        message(sprintf("  Hi-res GIF: %s (%.1f MB)", basename(image_path),
+                        file.info(image_path)$size / 1e6))
+      }, error = function(e) {
+        message("  WARNING: hi-res GIF failed: ", conditionMessage(e))
+        if (file.exists(image_path) && file.info(image_path)$size == 0)
+          file.remove(image_path)
+      })
+    }
 
-  # Lo-res: gifski resizes internally in Rust
-  if (!file.exists(image_path_lores)) {
-    lores_w <- round(full_w * 0.38)
-    lores_h <- round(full_h * 0.38)
-    gifski::gifski(png_files = png_frames, gif_file = image_path_lores,
-                   width = lores_w, height = lores_h,
-                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
-    message(sprintf("  Lo-res GIF: %s (%.1f MB)", basename(image_path_lores),
-                    file.info(image_path_lores)$size / 1e6))
+    # Lo-res: gifski resizes internally in Rust
+    if (!file.exists(image_path_lores)) {
+      lores_w <- round(full_w * 0.38)
+      lores_h <- round(full_h * 0.38)
+      tryCatch({
+        gifski::gifski(png_files = png_frames, gif_file = image_path_lores,
+                       width = lores_w, height = lores_h,
+                       delay = 1 / fps_val, loop = TRUE, progress = TRUE)
+        message(sprintf("  Lo-res GIF: %s (%.1f MB)", basename(image_path_lores),
+                        file.info(image_path_lores)$size / 1e6))
+      }, error = function(e) {
+        message("  WARNING: lo-res GIF failed: ", conditionMessage(e))
+        if (file.exists(image_path_lores) && file.info(image_path_lores)$size == 0)
+          file.remove(image_path_lores)
+      })
+    }
   }
 } else {
   message("No PNG frames found, skipping GIF assembly.")
-}
-
-if (file.exists(image_path) && file.exists(image_path_lores)) {
-  message("Animated GIFs already exist, skipping.")
 }
 message(sprintf("  GIF assembly complete in %.1fs", proc.time()["elapsed"] - t_gif))
 bench_checkpoint("DONE")
