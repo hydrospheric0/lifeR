@@ -318,7 +318,8 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
 # Typical speedup vs streaming: ~20–40% at 9km, ~30–50% at 3km.
 # ---------------------------------------------------------------------------
 
-# Convert study_area to a terra SpatVector once; reused throughout.
+# Convert study_area to a terra SpatVector once; reused for the probe.
+# (Re-created each chunk in the loop below to guard against gc() invalidation.)
 study_area_vect <- terra::vect(study_area)
 
 # Probe: load + crop the first valid species to get actual cropped dimensions.
@@ -371,6 +372,9 @@ message(sprintf("Accumulating %d species in %d chunk(s) at %s…",
 t_accum <- proc.time()["elapsed"]
 
 for (chunk_i in seq_along(sp_chunks)) {
+  # Recreate SpatVector each chunk — terra may invalidate the backing after gc().
+  study_area_vect <- terra::vect(study_area)
+
   idx_range <- sp_chunks[[chunk_i]]
   if (length(sp_chunks) > 1L)
     message(sprintf("  Chunk %d/%d — species %d–%d of %d",
