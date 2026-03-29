@@ -3,6 +3,23 @@
 # Ensure user library is on the path (packages installed via install_packages.R)
 .libPaths(c(path.expand("~/R/library"), .libPaths()))
 
+# ---------------------------------------------------------------------------
+# Benchmark helpers — emit [BENCH] lines consumed by benchmark_compare.sh
+# ---------------------------------------------------------------------------
+.bench_t0 <- proc.time()["elapsed"]
+bench_checkpoint <- function(label) {
+  elapsed <- proc.time()["elapsed"] - .bench_t0
+  mem_avail_kb <- tryCatch(
+    as.numeric(system("awk '/MemAvailable/{print $2}' /proc/meminfo", intern = TRUE)),
+    error = function(e) NA_real_)
+  mem_total_kb <- tryCatch(
+    as.numeric(system("awk '/MemTotal/{print $2}' /proc/meminfo", intern = TRUE)),
+    error = function(e) NA_real_)
+  mem_used_gb <- (mem_total_kb - mem_avail_kb) / 1e6
+  message(sprintf("[BENCH] %s | elapsed=%.1fs | RAM_used=%.1f GB",
+    label, elapsed, mem_used_gb))
+}
+
 # Load packages
 library(ggplot2)
 library(dplyr)
@@ -25,8 +42,7 @@ library(png)
 
 here()
 
-# ---------------------------------------------------------------------------
-# Portability: detect hardware and set safe defaults
+bench_checkpoint("START")
 # ---------------------------------------------------------------------------
 n_cores_physical <- max(1L, parallel::detectCores(logical = FALSE))
 n_cores_logical  <- max(1L, parallel::detectCores(logical = TRUE))
@@ -115,7 +131,11 @@ user_short <- NA # e.g., "Sam" - optional to customize name in legend. Typically
 your_ebird_dat <- here("MyEBirdData.csv") # path to where your personal eBird data are stored
 needs_list_to_use <- "regional" # set to "global" if you want to map true lifers (species you haven't observed anywhere); set to "regional" if you'd like to map needs for the specified region.
 resolution <- "3km" # "3km", "9km", or "27km"
-annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
+# Allow resolution override from benchmark harness
+if (!is.na(Sys.getenv("BENCH_RESOLUTION", unset = NA))) {
+  resolution <- Sys.getenv("BENCH_RESOLUTION")
+  message(sprintf("[BENCH] resolution overridden to '%s' by BENCH_RESOLUTION env var", resolution))
+}annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "dark" # accepted values "light_blue", "dark", "light_green"
 
@@ -173,6 +193,7 @@ sp_region <- ebirdregionspecies(region, key = ebird_api_key) %>%
   left_join(sp_all) %>%
   drop_na(Common.Name)
 message(sprintf("[1/4] Species in %s regional checklist (eBird): %d", region, nrow(sp_region)))
+bench_checkpoint("species_discovery")
 message(sprintf("      User species seen in %s (%s list): %d",
   region, needs_list_to_use,
   if (needs_list_to_use == "global") nrow(sp_user_all) else nrow(sp_user_region)))
@@ -471,6 +492,7 @@ sp_ebst_for_run_in_region <- sp_ebst_for_run %>%
 message(sprintf("[4/4] Species exceeding %.0f%% occurrence threshold in %s: %d  (dropped %d below threshold)",
   possible_occurrence_threshold * 100, region,
   length(sp_codes_in_region), nrow(sp_ebst_for_run) - length(sp_codes_in_region)))
+bench_checkpoint("after_accumulation")
 
 if (annotate == TRUE) {
   polys <- do.call("rbind", polys_list) %>%
@@ -489,6 +511,7 @@ possible_lifers <- lapply(possible_lifers, function(r) {
   terra::trim(r)
 })
 message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
+bench_checkpoint("after_reproject")
 gc()
 
 # Finalise annotation data frame (polys_list was built per-species in the chunk loop above)
@@ -619,6 +642,7 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
   gc()
 }
 message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_render))
+bench_checkpoint("after_frame_render")
 rm(possible_lifers)
 gc()
 
@@ -673,3 +697,4 @@ if (file.exists(image_path) && file.exists(image_path_lores)) {
   message("Animated GIFs already exist, skipping.")
 }
 message(sprintf("  GIF assembly complete in %.1fs", proc.time()["elapsed"] - t_gif))
+bench_checkpoint("DONE")
