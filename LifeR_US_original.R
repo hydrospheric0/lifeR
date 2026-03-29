@@ -20,92 +20,9 @@ library(sf)
 library(rnaturalearth)
 #library(rnaturalearthhires)
 library(tidyterra)
-library(gifski)
-library(png)
+library(magick)
 
 here()
-
-# ---------------------------------------------------------------------------
-# Portability: detect hardware and set safe defaults
-# ---------------------------------------------------------------------------
-n_cores_physical <- max(1L, parallel::detectCores(logical = FALSE))
-n_cores_logical  <- max(1L, parallel::detectCores(logical = TRUE))
-# Leave at least 2 physical cores free for OS / other tasks
-n_workers <- max(1L, n_cores_physical - 2L)
-
-# Available RAM (Linux /proc/meminfo, fallback for macOS/other)
-get_available_ram_gb <- function() {
-  if (file.exists("/proc/meminfo")) {
-    lines <- readLines("/proc/meminfo", warn = FALSE)
-    avail <- grep("MemAvailable", lines, value = TRUE)
-    if (length(avail) > 0) {
-      return(as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1", avail[1])) / 1e6)
-    }
-  }
-  # macOS fallback
-  tryCatch({
-    val <- system("sysctl -n hw.memsize 2>/dev/null", intern = TRUE)
-    as.numeric(val) / 1e9
-  }, error = function(e) NA_real_)
-}
-
-# Available disk space on the output volume (GB)
-get_available_disk_gb <- function(path = here()) {
-  tryCatch({
-    df_out <- system(sprintf("df -BG '%s' 2>/dev/null | tail -1", path), intern = TRUE)
-    as.numeric(gsub("G", "", strsplit(trimws(df_out), "\\s+")[[1]][4]))
-  }, error = function(e) NA_real_)
-}
-
-# Process RSS in GB (Linux only)
-get_process_rss_gb <- function() {
-  tryCatch({
-    lines <- readLines("/proc/self/status", warn = FALSE)
-    val   <- grep("^VmRSS:", lines, value = TRUE)
-    if (length(val) == 0L) return(NA_real_)
-    as.numeric(gsub("[^0-9]", "", val[1L])) / 1e6
-  }, error = function(e) NA_real_)
-}
-
-# Guard: abort if RSS exceeds a safe fraction of available memory
-check_memory_pressure <- function(label = "", max_fraction = 0.85) {
-  rss_gb  <- get_process_rss_gb()
-  avail   <- get_available_ram_gb()
-  if (is.na(rss_gb) || is.na(avail)) return(invisible(NULL))  # non-Linux: skip
-  total_gb <- as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1",
-    grep("MemTotal", readLines("/proc/meminfo", warn = FALSE), value = TRUE)[1])) / 1e6
-  if (rss_gb > total_gb * max_fraction) {
-    stop(sprintf(
-      "Memory safety limit reached at [%s]: process using %.1f GB / %.1f GB total (%.0f%%).\n  Free up memory or use a coarser resolution.",
-      label, rss_gb, total_gb, rss_gb / total_gb * 100))
-  }
-  invisible(rss_gb)
-}
-
-# Guard: abort if disk space is too low for output
-check_disk_space <- function(min_gb = 2, path = here()) {
-  avail <- get_available_disk_gb(path)
-  if (!is.na(avail) && avail < min_gb) {
-    stop(sprintf(
-      "Insufficient disk space: %.1f GB available, need at least %d GB.\n  Free disk space or change output directory.",
-      avail, min_gb))
-  }
-  invisible(avail)
-}
-
-ram_gb  <- get_available_ram_gb()
-disk_gb <- get_available_disk_gb()
-message(sprintf("[hardware] %d physical cores, %d logical | %.0f GB RAM available | %.0f GB disk free",
-  n_cores_physical, n_cores_logical,
-  ifelse(is.na(ram_gb), -1, ram_gb),
-  ifelse(is.na(disk_gb), -1, disk_gb)))
-message(sprintf("[hardware] Using %d workers for parallel operations", n_workers))
-
-# Configure terra memory management (leave threading at terra defaults)
-terra::terraOptions(
-  memfrac = 0.7,
-  progress = 0L
-)
 
 # Store S&T rasters in the project folder (data/ebirdst/) rather than the
 # hidden R per-user directory.  Python scripts and R scripts share this path.
@@ -251,31 +168,23 @@ if (length(needs_download) > 0) {
   message("All species data already cached, skipping download.")
 }
 
-# Guard against OOM — resolution-dependent memory estimate.
-# 3km loads ~9x more data than 9km; 27km is lightweight.
-mem_required_gb <- switch(resolution,
-  "3km"  = 150,
-  "9km"  = 20,
-  "27km" = 4,
-  20  # fallback
-)
-ram_now <- get_available_ram_gb()
-if (!is.na(ram_now)) {
-  if (ram_now < mem_required_gb) {
+# Guard against OOM at 3km — loading all ~560 species at 3km requires ~500 GB RAM.
+# Check available memory on Linux before proceeding; abort with a clear message if insufficient.
+if (resolution == "3km" && file.exists("/proc/meminfo")) {
+  mem_avail_kb <- as.numeric(sub(".*:\\s*(\\d+)\\s*kB.*", "\\1",
+    grep("MemAvailable", readLines("/proc/meminfo"), value = TRUE)[1]))
+  mem_avail_gb <- mem_avail_kb / 1e6
+  mem_required_gb <- 150  # conservative floor; 3km OOM observed below this
+  if (mem_avail_gb < mem_required_gb) {
     stop(sprintf(paste0(
-      "%s resolution requires ~%d GB RAM.\n",
+      "3km loads ~9x more raster data than 9km.\n",
       "  Available RAM : %.0f GB\n",
-      "Switch to a coarser resolution, or run on a machine with more RAM."),
-      resolution, mem_required_gb, ram_now))
+      "  Required (est): %.0f GB\n",
+      "Switch to resolution = '9km' or '27km', or run on a machine with more RAM."),
+      mem_avail_gb, mem_required_gb))
   }
-  message(sprintf("[RAM check] %s: %.0f GB available, ~%d GB needed — proceeding.",
-    resolution, ram_now, mem_required_gb))
-} else {
-  message("[RAM check] Could not detect available memory — proceeding with caution.")
+  message(sprintf("[RAM check] 3km: %.0f GB available — proceeding.", mem_avail_gb))
 }
-
-# Disk space guard: need at least 2 GB for outputs
-check_disk_space(min_gb = 2)
 
 # Load occurrence rasters for all species in species list (skip any that fail to load)
 load_raster_safe <- function(sp_code, ...) {
@@ -287,12 +196,8 @@ load_raster_safe <- function(sp_code, ...) {
     }
   )
 }
-message(sprintf("Loading %d species rasters at %s…", nrow(sp_ebst_for_run), resolution))
-t_load <- proc.time()["elapsed"]
 occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster_safe, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
 occ_combined <- Filter(Negate(is.null), occ_combined)
-message(sprintf("  Loaded %d rasters in %.1fs", length(occ_combined), proc.time()["elapsed"] - t_load))
-check_memory_pressure("after raster load")
 
 # Load proportion population rasters for all species in species list
 if (annotate == TRUE) {
@@ -316,7 +221,7 @@ if (!region %in% c("US-HI", "US-AK")) {
   study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
 } # if region is US only mapping continental US
 study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
-# if (requireNamespace("mapview", quietly = TRUE)) mapview::mapview(study_area)  # interactive only
+if (requireNamespace("mapview", quietly = TRUE)) mapview::mapview(study_area)
 
 # Define occurrence threshold for when a species is "possible"
 possible_occurrence_threshold <- 0.01 # minimum occurrence probability for a species to be considered "possible" at a given time/location.
@@ -335,15 +240,11 @@ filter_rasters_to_sp_above_threshold <- function(z) {
   z
 }
 
-# Crop and mask rasters (sequential — terra SpatRaster objects cannot cross fork boundaries)
-message(sprintf("Cropping and masking %d rasters…", length(occ_combined)))
-t_crop <- proc.time()["elapsed"]
-study_vect <- terra::vect(study_area)
-occ_crop_combined <- sapply(occ_combined, function(r) terra::mask(terra::crop(r, y = study_vect), mask = study_vect))
+# Crop the rasters using the vector extent
+occ_crop_combined <- sapply(occ_combined, terra::crop, y = terra::vect(study_area))
 occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-message(sprintf("  Crop+mask complete in %.1fs (%d species kept)", proc.time()["elapsed"] - t_crop, length(occ_crop_combined)))
-check_memory_pressure("after crop+mask")
-rm(study_vect)
+occ_crop_combined <- sapply(occ_crop_combined, terra::mask, mask = terra::vect(study_area))
+occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
 # occ_crop_combined <- sapply(occ_crop_combined, terra::trim)
 
 if (annotate == TRUE) {
@@ -366,37 +267,27 @@ message(sprintf("[4/4] Species exceeding %.0f%% occurrence threshold anywhere in
   possible_occurrence_threshold * 100, region,
   nrow(sp_ebst_for_run_in_region), nrow(sp_ebst_for_run) - nrow(sp_ebst_for_run_in_region)))
 
-# Function for viewing summarized species rasters (interactive use only)
+# Function for viewing summarized species rasters (not run)
 view_sp <- function(x) {
   sp_max <- (raster::raster(max(occ_crop_combined[[x]])))
   mapview::mapview(sp_max)
 }
-# view_sp("casspa")  # uncomment for interactive exploration
+view_sp("casspa")
 
-# Sum number of "possible" species in each cell based on occurrence probability
-# and the defined threshold. Each week stored as a single-layer SpatRaster.
-message("Accumulating weekly lifer counts (52 weeks)…")
-t_accum <- proc.time()["elapsed"]
+# Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each week stored as a single-layer SpatRaster in a list.
 possible_lifers <- list()
 for (i in 1:52) {
   week_slice <- lapply(occ_crop_combined, subset, subset = i)
   week_slice <- rast(week_slice)
   week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
-  possible_lifers[[i]] <- sum(week_slice, na.rm = TRUE)
+  week_slice <- sum(week_slice, na.rm = TRUE)
+  possible_lifers[[i]] <- week_slice
 }
-check_memory_pressure("after accumulation")
-message(sprintf("  Accumulation complete in %.1fs", proc.time()["elapsed"] - t_accum))
 
-# Reproject, mask, and trim weekly lifer count rasters
-message("Reprojecting 52 weekly rasters…")
-t_reproj <- proc.time()["elapsed"]
-study_area_5070 <- project(vect(study_area), y = "epsg:5070")
-possible_lifers <- lapply(possible_lifers, function(r) {
-  r <- terra::project(r, y = "epsg:5070", method = "near")
-  r <- terra::mask(r, mask = study_area_5070)
-  trim(r)
-})
-message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
+# Reproject, mask, and trim weekly lifer count rasters for plotting
+possible_lifers <- sapply(possible_lifers, terra::project, y = "epsg:5070", method = "near")
+possible_lifers <- sapply(possible_lifers, terra::mask, mask = project(vect(study_area), y = "epsg:5070"))
+possible_lifers <- sapply(possible_lifers, trim)
 
 # Save week date labels before freeing raster stacks
 week_dates <- names(occ_crop_combined[[1]])
@@ -469,14 +360,8 @@ legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
-# Rendering stays sequential because ggplot + ggsave use terra SpatRasters internally.
-message(sprintf("Rendering %d weekly maps…", length(possible_lifers)))
-t_render <- proc.time()["elapsed"]
-check_disk_space(min_gb = 1)
-for (i in seq_along(possible_lifers)) {
+for (i in 1:length(possible_lifers)) {
   date <- week_dates[i]
-  png_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".png"))
-  if (file.exists(png_path)) next
   if (needs_list_to_use == "global") {
     legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " potential lifers")
   }
@@ -548,19 +433,17 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
       legend.text.align = 0.5
     )
   week_plot
-  ggsave(filename = png_path, plot = week_plot, bg = "white", width = 1920, height = 1600, units = "px")
+  jpg_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".jpg"))
+  if (!file.exists(jpg_path)) {
+    ggsave(filename = jpg_path, plot = week_plot, bg = "white", height = 5.35, width = 6.6)
+  }
   rm(week_plot)
   gc()
 }
-message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_render))
 rm(possible_lifers)
 gc()
 
 # Generate animated gif (full size and smaller for sharing)
-message("Assembling animated GIFs…")
-check_disk_space(min_gb = 1)
-check_memory_pressure("before GIF assembly")
-t_gif <- proc.time()["elapsed"]
 fps_val <- if (annotate == TRUE) 0.5 else 5
 image_path <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
@@ -571,39 +454,27 @@ image_path_lores <- here(outputDir, "Animated_map", paste0(
   "_lores_", if (annotate) "annotated_", user_file, ".gif"
 ))
 
-# gifski reads PNGs directly in Rust — no R image objects needed.
-png_frames <- sort(list.files(here(outputDir, "Weekly_maps"), pattern = "\\.png$", full.names = TRUE))
+if (!file.exists(image_path) || !file.exists(image_path_lores)) {
+  imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
+  img_joined <- image_join(lapply(imgs, image_read))
 
-if (length(png_frames) > 0) {
-  # Read actual pixel dimensions from the first frame
-  first_dim <- dim(png::readPNG(png_frames[1]))  # height × width × channels
-  full_w <- first_dim[2]
-  full_h <- first_dim[1]
-
-  # Hi-res: pass native frame dimensions so gifski doesn't downscale
+  # Use image_write_gif (gifski backend) to avoid ImageMagick segfault on large GIFs
   if (!file.exists(image_path)) {
-    gifski::gifski(png_files = png_frames, gif_file = image_path,
-                   width = full_w, height = full_h,
-                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
-    message(sprintf("  Hi-res GIF: %s (%.1f MB)", basename(image_path),
-                    file.info(image_path)$size / 1e6))
+    image_write_gif(img_joined, path = image_path, delay = 1 / fps_val)
   }
 
-  # Lo-res: gifski resizes internally in Rust
+  # Scale down for sharing (from in-memory frames, avoid re-reading the large GIF)
   if (!file.exists(image_path_lores)) {
-    lores_w <- round(full_w * 0.38)
-    lores_h <- round(full_h * 0.38)
-    gifski::gifski(png_files = png_frames, gif_file = image_path_lores,
-                   width = lores_w, height = lores_h,
-                   delay = 1 / fps_val, loop = TRUE, progress = TRUE)
-    message(sprintf("  Lo-res GIF: %s (%.1f MB)", basename(image_path_lores),
-                    file.info(image_path_lores)$size / 1e6))
+    lores <- image_scale(img_joined, geometry_size_percent(width = 38, height = NULL))
+    rm(img_joined)
+    gc()
+    image_write_gif(lores, path = image_path_lores, delay = 1 / fps_val)
+    rm(lores)
+    gc()
+  } else {
+    rm(img_joined)
+    gc()
   }
 } else {
-  message("No PNG frames found, skipping GIF assembly.")
-}
-
-if (file.exists(image_path) && file.exists(image_path_lores)) {
   message("Animated GIFs already exist, skipping.")
 }
-message(sprintf("  GIF assembly complete in %.1fs", proc.time()["elapsed"] - t_gif))

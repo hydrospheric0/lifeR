@@ -10,5 +10,12 @@ pushit.sh
 # Script output
 Results/
 
+# NaturalEarth admin boundaries cache (regenerated on first run)
+ne_admin1_large.rds
+
+# Benchmark artefacts
+benchmark_results/
+
 # eBird S&T raster cache (large binary files, project-local)
 data/ebirdst/
+data/
