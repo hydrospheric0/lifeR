@@ -167,7 +167,6 @@ sp_region <- ebirdregionspecies(region, key = ebird_api_key) %>%
   left_join(sp_all) %>%
   drop_na(Common.Name)
 message(sprintf("[1/4] Species in %s regional checklist (eBird): %d", region, nrow(sp_region)))
-bench_checkpoint("species_discovery")
 message(sprintf("      User species seen in %s (%s list): %d",
   region, needs_list_to_use,
   if (needs_list_to_use == "global") nrow(sp_user_all) else nrow(sp_user_region)))
