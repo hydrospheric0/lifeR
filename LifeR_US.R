@@ -372,6 +372,20 @@ raster_template <- r_probe
 if (!is.null(raster_template)) terra::values(raster_template) <- 0L
 rm(r_probe)
 
+# Pre-compute crop extent and outside-boundary mask ONCE.
+# terra::mask() rasterizes the boundary polygon onto the raster grid each call.
+# By doing it once here and applying as a logical vector in the loop we avoid
+# ~500 polygon rasterization calls -- the dominant per-species overhead.
+fixed_ext    <- if (!is.null(raster_template)) terra::ext(raster_template) else NULL
+outside_mask <- NULL
+if (!is.null(raster_template)) {
+  r_tmp        <- terra::mask(raster_template[[1L]], study_area_vect)
+  outside_mask <- is.na(terra::values(r_tmp)[, 1L])
+  rm(r_tmp)
+  message(sprintf("  Boundary mask: %d inside / %d total cells (%.0f%% inside boundary)",
+    sum(!outside_mask), length(outside_mask), 100 * mean(!outside_mask)))
+}
+
 # gc() cadence: every ~gc_every species.  Larger = fewer gc() calls = faster;
 # smaller = lower peak RAM.  ~50 is a good balance at any resolution.
 avail_gb_now <- tryCatch(
@@ -404,16 +418,22 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
                         metric = "median", resolution = resolution)
   if (is.null(r)) next
 
-  r <- terra::crop(r, study_area_vect)
-  r <- terra::mask(r, study_area_vect)
-  if (max(terra::minmax(r)) <= possible_occurrence_threshold) { rm(r); gc(); next }
-
-  sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+  r <- terra::crop(r, fixed_ext)
   if (is.null(week_dates)) week_dates <- names(r)
 
-  # Extract to raw matrix and threshold  -  NA (outside mask) becomes 0
+  # Extract to raw matrix; apply pre-computed boundary mask (single vector op,
+  # no polygon rasterization per species).
   vals <- terra::values(r)              # n_cells x 52 numeric matrix
   rm(r)
+  if (!is.null(outside_mask)) vals[outside_mask, ] <- NA_real_
+
+  # Skip species with no occurrence above threshold inside the boundary
+  inside_max <- if (!is.null(outside_mask)) max(vals[!outside_mask, ], na.rm = TRUE)
+                else max(vals, na.rm = TRUE)
+  if (is.na(inside_max) || inside_max <= possible_occurrence_threshold) { rm(vals); next }
+
+  sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+
   indicator <- (vals > possible_occurrence_threshold)
   indicator[is.na(indicator)] <- FALSE
   storage.mode(indicator) <- "integer"  # 0/1 integer, not logical
@@ -436,9 +456,11 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
                   metric = "median", resolution = resolution),
       error = function(e) NULL)
     if (!is.null(p)) {
-      p <- terra::crop(p, study_area_vect)
-      p <- terra::mask(p, study_area_vect)
-      if (max(terra::minmax(p)) > possible_occurrence_threshold) {
+      p <- terra::crop(p, fixed_ext)
+      if (!is.null(outside_mask)) {
+        pv <- terra::values(p); pv[outside_mask, ] <- NA_real_; terra::values(p) <- pv; rm(pv)
+      }
+      if (max(terra::minmax(p), na.rm = TRUE) > possible_occurrence_threshold) {
         max_val_cells <- terra::where.max(p, values = TRUE, list = FALSE) %>%
           as.data.frame() %>%
           dplyr::filter(value > 0)
