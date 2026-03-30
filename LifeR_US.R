@@ -542,18 +542,24 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
 }
 gc()
 
-# Scatter all 52 weeks into the 52-layer template in one matrix assignment.
-# One terra::values<- call replaces 52 allocate-fill-assign iterations.
+# Wrap the 52-column accumulator back into one SpatRaster per week.
+# Each week is kept as a separate single-layer raster so terra never spills
+# the full 52-layer stack to disk (which would make render reads slow).
 if (is.null(accum) || is.null(raster_template)) {
   stop("Accumulation produced no valid rasters - check that species tifs exist and region/resolution are correct.")
 }
-n_cells_full <- terra::ncell(raster_template[[1L]])
-v_full <- matrix(0L, nrow = n_cells_full, ncol = n_weeks)
-v_full[inside_idx, ] <- accum
-rm(accum)
-terra::values(raster_template) <- v_full
-rm(v_full)
-names(raster_template) <- week_dates
+template_single <- raster_template[[1L]]
+n_cells_full    <- terra::ncell(template_single)
+possible_lifers <- vector("list", n_weeks)
+for (wk in seq_len(n_weeks)) {
+  r_wk <- template_single
+  v <- numeric(n_cells_full)
+  v[inside_idx] <- accum[, wk]
+  terra::values(r_wk) <- v
+  names(r_wk) <- week_dates[wk]
+  possible_lifers[[wk]] <- r_wk
+}
+rm(template_single, n_cells_full, v, accum, raster_template)
 
 # New version of species data frame with only species meeting occ threshold
 sp_ebst_for_run_in_region <- sp_ebst_for_run %>%
@@ -569,17 +575,18 @@ if (annotate == TRUE) {
   rm(polys_list); gc()
 }
 
-# Reproject, mask, and trim the full 52-layer stack in 3 terra operations
-# instead of 3 x 52 = 156 individual-raster calls.
-message("Reprojecting 52-layer stack...")
+# Reproject, mask, and trim each weekly raster individually.
+# Per-layer ops keep each raster small enough for terra to hold in RAM;
+# a 52-layer stack would be spilled to disk, making downstream reads slow.
+message("Reprojecting 52 weekly rasters...")
 t_reproj <- proc.time()["elapsed"]
 study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
-raster_template <- terra::project(raster_template, y = "epsg:5070", method = "near")
-raster_template <- terra::mask(raster_template, mask = study_area_5070)
-raster_template <- terra::trim(raster_template)
+possible_lifers <- lapply(possible_lifers, function(r) {
+  r <- terra::project(r, y = "epsg:5070", method = "near")
+  r <- terra::mask(r, mask = study_area_5070)
+  terra::trim(r)
+})
 message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
-possible_lifers <- lapply(seq_len(n_weeks), function(i) raster_template[[i]])
-rm(raster_template)
 gc()
 
 # polys was already finalised above
