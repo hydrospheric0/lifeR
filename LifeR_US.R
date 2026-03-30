@@ -575,11 +575,14 @@ gc()
 # Cost: 52 terra::setValues() calls  -  trivial vs 561 x 52 terra ops before.
 possible_lifers <- vector("list", n_weeks)
 if (!is.null(accum) && !is.null(raster_template)) {
+  template_single <- raster_template[[1L]]  # single-layer shell; avoids 52-layer copies
   for (wk in seq_len(n_weeks)) {
-    r_wk <- raster_template
+    r_wk <- template_single
     terra::values(r_wk) <- accum[, wk]
+    names(r_wk) <- week_dates[wk]
     possible_lifers[[wk]] <- r_wk
   }
+  rm(template_single)
   rm(accum, raster_template)
 } else {
   stop("Accumulation produced no valid rasters - check that species tifs exist and region/resolution are correct.")
