@@ -17,6 +17,7 @@ ne_admin1_large.rds
 benchmark.sh
 benchmark_compare.sh
 benchmark_results/
+benchmark_logs/
 BENCHMARK_RESULTS.md
 
 # Intermediate/archived script versions
