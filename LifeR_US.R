@@ -541,6 +541,8 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
   }
 }
 gc()
+message(sprintf("+ accumulation: %.1fs  [RAM] rss=%.1fGB avail=%.1fGB",
+  proc.time()["elapsed"] - t_accum, get_process_rss_gb(), get_available_ram_gb()))
 
 # Wrap the 52-column accumulator back into one SpatRaster per week.
 # Each week is kept as a separate single-layer raster so terra never spills
@@ -586,7 +588,8 @@ possible_lifers <- lapply(possible_lifers, function(r) {
   r <- terra::mask(r, mask = study_area_5070)
   terra::trim(r)
 })
-message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
+message(sprintf("+ reprojection: %.1fs  [RAM] rss=%.1fGB avail=%.1fGB",
+  proc.time()["elapsed"] - t_reproj, get_process_rss_gb(), get_available_ram_gb()))
 gc()
 
 # polys was already finalised above
@@ -729,7 +732,8 @@ for (i in seq_along(possible_lifers)) {
   rm(week_plot)
   if (i %% 5L == 0L) gc()
 }
-message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_render))
+message(sprintf("+ render: %.1fs  [RAM] rss=%.1fGB avail=%.1fGB",
+  proc.time()["elapsed"] - t_render, get_process_rss_gb(), get_available_ram_gb()))
 rm(possible_lifers)
 gc()
 
@@ -802,4 +806,5 @@ if (length(png_frames) > 0) {
 } else {
   message("No PNG frames found, skipping GIF assembly.")
 }
-message(sprintf("  GIF assembly complete in %.1fs", proc.time()["elapsed"] - t_gif))
+message(sprintf("+ gif: %.1fs  [RAM] rss=%.1fGB avail=%.1fGB",
+  proc.time()["elapsed"] - t_gif, get_process_rss_gb(), get_available_ram_gb()))
