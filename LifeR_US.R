@@ -609,42 +609,98 @@ if (theme == "dark") {
   font_color_dark <- "grey90"
 }
 
+# Pre-aggregate rasters to display resolution once before the render loop.
+# tidyterra::geom_spatraster defaults to maxcell=5e5; without this it resamples
+# independently on every one of the 52 frames.  One aggregate call here eliminates
+# 52 per-frame terra resample ops and removes the "[SpatRaster] resampled to N cells"
+# messages.  fun="max" preserves the highest lifer-count value in each merged cell
+# so genuine hotspot peaks are not blurred.
+display_maxcells <- 5e5L
+n_cells_display  <- terra::ncell(possible_lifers[[1L]])
+if (n_cells_display > display_maxcells) {
+  agg_fact <- max(1L, floor(sqrt(n_cells_display / display_maxcells)))
+  message(sprintf("  Pre-aggregating 52 rasters by factor %d for display (%d -> ~%d cells)...",
+    agg_fact, n_cells_display, terra::ncell(terra::aggregate(possible_lifers[[1L]], fact = agg_fact))))
+  possible_lifers <- lapply(possible_lifers, terra::aggregate, fact = agg_fact, fun = "max")
+  gc()
+}
+
 # Get maximum lifer count (across all cells and weeks). Needed for legend.
 max_val_possible <- lapply(possible_lifers, minmax) %>%
   sapply(max) %>%
   max()
 
-# Get legend breaks/labels/range based on maximum count.
-legend_breaks <- c(pretty(1:max_val_possible))
-labels <- function(x) {
+# Pre-build all static ggplot components once — rebuilt 52x in the original loop.
+legend_breaks     <- c(pretty(1:max_val_possible))
+labels_fn <- function(x) {
   lab <- " species"
   x_last <- as.character(paste0(tail(x, n = 1), lab))
   x_last_pad <- str_pad(x_last, nchar(x_last) * 2 + nchar(tail(x, n = 1)) + 1, side = "left")
   c(x[1:(length(x) - 1)], x_last_pad)
 }
-legend_labels <- labels(legend_breaks)
+legend_labels     <- labels_fn(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
+legend_lab <- paste0(ifelse(is.na(user_short), "My", paste0(user_short, "'s")),
+                     if (needs_list_to_use == "global") " potential lifers" else " regional needs")
+caption_text <- paste0(
+  "Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\n\n",
+  "A candidate lifer is considered `possible` if the species has a >",
+  round(possible_occurrence_threshold * 100, 0),
+  "% modeled occurrence probability at the location and date.\n\n",
+  "Data from 2023 eBird Status & Trends products (https://ebird.org/science/status-and-trends): ",
+  "Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n",
+  " W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, C. Davis, M. Stokowski, ",
+  "A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2024. eBird Status and Trends, Data Version:\n",
+  "2023; Released: 2025. Cornell Lab of Ornithology, Ithaca, New York. ",
+  "https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n",
+  " Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions ",
+  "or recommendations expressed in this material are those of the author(s)\n",
+  "and do not necessarily reflect the views of the Cornell Lab of Ornithology.")
+
+base_scale <- scale_fill_viridis_c(
+  limits = c(0, legend_breaks_last), na.value = "transparent", option = "turbo",
+  guide  = guide_colorbar(title.position = "top", title.hjust = .5),
+  breaks = legend_breaks,
+  labels = legend_labels)
+
+base_theme <- ggthemes::theme_fivethirtyeight() +
+  theme(
+    rect             = element_rect(linetype = 1, colour = NA),
+    plot.title       = element_text(size = 10, hjust = 0, face = "plain",
+                                    color = font_color_light, margin = margin(0, 0, 15, 0)),
+    plot.tag         = element_text(size = 10, face = "bold", color = font_color_dark),
+    axis.title.y     = element_blank(),
+    axis.title.x     = element_blank(),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_blank(),
+    plot.caption     = element_text(size = 5, hjust = 0, color = font_color_light),
+    plot.background  = element_rect(fill = bg_color),
+    panel.background = element_rect(fill = bg_color),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_blank(),
+    legend.title     = element_text(size = 10, face = "bold", color = font_color_dark),
+    legend.text      = element_text(color = font_color_dark),
+    legend.title.align    = 1,
+    legend.direction      = "horizontal",
+    legend.key.width      = unit(.32, "inch"),
+    legend.key.height     = unit(.06, "inch"),
+    legend.position       = c(.768, 1.03),
+    plot.tag.position     = c(0.05, .94),
+    legend.background     = element_rect(colour = NA, fill = NA, linetype = "solid"),
+    legend.text.align     = 0.5)
 
 # Generate and save map for each week.
-# Rendering stays sequential because ggplot + ggsave use terra SpatRasters internally.
 message(sprintf("Rendering %d weekly maps...", length(possible_lifers)))
 t_render <- proc.time()["elapsed"]
 check_disk_space(min_gb = 1)
 for (i in seq_along(possible_lifers)) {
-  date <- week_dates[i]
+  date     <- week_dates[i]
   png_path <- here(outputDir, "Weekly_maps", paste0(region, "_", date, ".png"))
   if (file.exists(png_path)) next
-  if (needs_list_to_use == "global") {
-    legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " potential lifers")
-  }
-  if (needs_list_to_use == "regional") {
-    legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " regional needs")
-  }
   week_plot <- ggplot() +
-    geom_spatraster(data = possible_lifers[[i]]) +
+    geom_spatraster(data = possible_lifers[[i]], maxcell = Inf) +
     geom_sf(data = study_area, fill = NA, color = alpha("white", .3)) +
-    
-    # Add annotation if option is turned on
     {
       if (annotate == TRUE) {
         ggsflabel::geom_sf_text_repel(
@@ -661,49 +717,13 @@ for (i in seq_along(possible_lifers)) {
           color = "white", shape = 1, size = 1.5)
       }
     } +
-    scale_fill_viridis_c(
-      limits = c(0, legend_breaks_last), na.value = "transparent", option = "turbo",
-      guide = guide_colorbar(title.position = "top", title.hjust = .5),
-      breaks = legend_breaks,
-      labels = legend_labels
-    ) +
+    base_scale +
     labs(
-      title = "Lifer finder: mapping the birds you've yet to meet",
-      tag = paste0(format(ymd(date), format = "%b-%d")),
-      # subtitle = "Mapping the birds you've yet to meet",
-      fill = legend_lab,
-      caption = paste0("Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\n\nA candidate lifer is considered `possible` if the species has a >", round(possible_occurrence_threshold * 100, 0), "% modeled occurrence probability at the location and date.\n
-Data from 2023 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, C. Davis, M. Stokowski, A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2024. eBird Status and Trends, Data Version:\n2023; Released: 2025. Cornell Lab of Ornithology, Ithaca, New York. https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s)\nand do not necessarily reflect the views of the Cornell Lab of Ornithology.")
-    ) +
-    ggthemes::theme_fivethirtyeight() +
-    theme(
-      rect = element_rect(linetype = 1, colour = NA),
-      plot.title = element_text(
-        size = 10, hjust = 0, face = "plain", color = font_color_light,
-        margin = margin(0, 0, 15, 0)
-      ),
-      plot.tag = element_text(size = 10, face = "bold", color = font_color_dark),
-      axis.title.y = element_blank(),
-      axis.title.x = element_blank(),
-      axis.text.x = element_blank(),
-      axis.text.y = element_blank(),
-      plot.caption = element_text(size = 5, hjust = 0, color = font_color_light),
-      plot.background = element_rect(fill = bg_color),
-      panel.background = element_rect(fill = bg_color),
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.border = element_blank(),
-      legend.title = element_text(size = 10, face = "bold", color = font_color_dark),
-      legend.text = element_text(color = font_color_dark),
-      legend.title.align = 1,
-      legend.direction = "horizontal",
-      legend.key.width = unit(.32, "inch"),
-      legend.key.height = unit(.06, "inch"),
-      legend.position = c(.768, 1.03),
-      plot.tag.position = c(0.05, .94),
-      legend.background = element_rect(colour = NA, fill = NA, linetype = "solid"),
-      legend.text.align = 0.5
-    )
+      title   = "Lifer finder: mapping the birds you've yet to meet",
+      tag     = paste0(format(ymd(date), format = "%b-%d")),
+      fill    = legend_lab,
+      caption = caption_text) +
+    base_theme
   week_plot
   ggsave(filename = png_path, plot = week_plot, bg = "white", width = 1920, height = 1600, units = "px")
   rm(week_plot)
