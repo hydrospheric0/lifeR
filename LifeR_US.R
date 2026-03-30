@@ -719,13 +719,14 @@ check_disk_space(min_gb = 1)
 check_memory_pressure("before GIF assembly")
 t_gif <- proc.time()["elapsed"]
 fps_val <- if (annotate == TRUE) 0.5 else 5
+annotate_suffix <- if (annotate) "annotated_" else ""
 image_path <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
-  "_hires_", if (annotate) "annotated_", user_file, ".gif"
+  "_hires_", annotate_suffix, user_file, ".gif"
 ))
 image_path_lores <- here(outputDir, "Animated_map", paste0(
   region, "_Animated_map_annual_", theme,
-  "_lores_", if (annotate) "annotated_", user_file, ".gif"
+  "_lores_", annotate_suffix, user_file, ".gif"
 ))
 
 # gifski reads PNGs directly in Rust  -  no R image objects needed.
@@ -737,7 +738,12 @@ if (length(png_frames) > 0) {
     message("  Animated GIFs already exist, skipping.")
   } else {
     # Read actual pixel dimensions from the first frame
-    first_dim <- dim(png::readPNG(png_frames[1]))  # height x width x channels
+    first_dim <- tryCatch(
+      dim(png::readPNG(png_frames[1])),
+      error = function(e) {
+        message("  WARNING: could not read first PNG frame to detect dimensions -- using default 1920x1600")
+        c(1600L, 1920L, 4L)
+      })
     full_w <- first_dim[2]
     full_h <- first_dim[1]
 
