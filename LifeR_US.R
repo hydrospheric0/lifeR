@@ -306,6 +306,7 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
 #      -> free full float64 grid immediately (~664 MB at 3km)
 #   3. Write uint8 .bin cache as side effect; reruns skip TIF entirely
 #   4. Write .skip marker for below-threshold species; reruns skip those too
+#      .skip files are invalidated automatically when threshold changes
 #   5. Accumulate inside-only (n_inside x 52) -- no full-grid scatter per species
 #   6. Wrap-back: one scatter (inside -> full grid) per week at the end
 # ---------------------------------------------------------------------------
@@ -374,6 +375,7 @@ thresh_uint8 <- as.integer(round(possible_occurrence_threshold * 255))
 # First run : reads TIF (332 MB) + writes 46 MB cache.  ~15% I/O overhead.
 # Run 2+    : reads 46 MB cache only.  ~7x less I/O than float32 TIF.
 # Cache is NOT annotation-aware -- annotation always uses the TIF slow path.
+# .skip files are invalidated automatically when the threshold changes.
 # ---------------------------------------------------------------------------
 r_sp_cache_dir       <- here("data", "r_sp_cache", region, resolution, "2023")
 r_sp_cache_meta_path <- file.path(r_sp_cache_dir, "_meta.rds")
@@ -392,18 +394,33 @@ if (!is.null(inside_idx)) {
       message("  R sp cache: geometry mismatch -- clearing and rebuilding")
       invisible(file.remove(list.files(r_sp_cache_dir, full.names = TRUE)))
       needs_new_meta <- TRUE
+    } else if (!isTRUE(all.equal(meta_chk$threshold, possible_occurrence_threshold))) {
+      # Threshold changed: .bin files are still valid (raw uint8 data),
+      # but .skip files are stale -- a species below the old threshold may
+      # now exceed the new one.  Delete only .skip files and re-evaluate.
+      skip_files <- list.files(r_sp_cache_dir, pattern = "\\.skip$", full.names = TRUE)
+      if (length(skip_files) > 0) invisible(file.remove(skip_files))
+      message(sprintf(
+        "  R sp cache: threshold changed (%.4f -> %.4f) -- cleared %d stale .skip files",
+        meta_chk$threshold, possible_occurrence_threshold, length(skip_files)))
+      needs_new_meta <- TRUE
+      r_sp_cache_valid <- TRUE
     } else {
       r_sp_cache_valid <- TRUE
-      n_cached <- length(list.files(r_sp_cache_dir, pattern = "\\.bin$"))
-      message(sprintf("  R sp cache: %d / %d species cached  (fast path for hits)",
-        n_cached, nrow(sp_ebst_for_run)))
+      n_bin  <- length(list.files(r_sp_cache_dir, pattern = "\\.bin$"))
+      n_skip <- length(list.files(r_sp_cache_dir, pattern = "\\.skip$"))
+      message(sprintf(
+        "  R sp cache: %d bin + %d skip / %d species  (%d uncached)",
+        n_bin, n_skip, nrow(sp_ebst_for_run),
+        nrow(sp_ebst_for_run) - n_bin - n_skip))
     }
   }
   if (needs_new_meta) {
     saveRDS(list(inside_idx = inside_idx, n_cells = length(outside_mask),
-                 n_weeks = n_weeks, week_dates = week_dates_probe),
+                 n_weeks = n_weeks, week_dates = week_dates_probe,
+                 threshold = possible_occurrence_threshold),
             r_sp_cache_meta_path)
-    r_sp_cache_valid <- TRUE  # cache is ready to populate this run
+    if (!r_sp_cache_valid) r_sp_cache_valid <- TRUE  # cache is ready to populate this run
   }
 }
 
@@ -443,19 +460,22 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
 
   if (!is.null(sp_cache_path) && file.exists(sp_cache_path)) {
     # ---- Fast path: 46 MB uint8 cache read vs 332 MB float32 TIF ----
-    raw_vals <- tryCatch(
-      readBin(sp_cache_path, raw(), n = length(inside_idx) * n_weeks),
+    # readBin(integer(), size=1) decodes bytes directly to int in one allocation,
+    # avoiding the intermediate raw vector that as.integer(readBin(raw())) would need.
+    n_elems  <- length(inside_idx) * n_weeks
+    int_vals <- tryCatch(
+      readBin(sp_cache_path, integer(), n = n_elems, size = 1L, signed = FALSE),
       error = function(e) { message("  Cache read error: ", sp_code); NULL })
-    cache_ok <- !is.null(raw_vals) && length(raw_vals) == length(inside_idx) * n_weeks
+    cache_ok <- !is.null(int_vals) && length(int_vals) == n_elems
     if (!cache_ok) {
-      if (!is.null(raw_vals)) file.remove(sp_cache_path)  # remove corrupt file
-      rm(raw_vals)
+      if (!is.null(int_vals)) file.remove(sp_cache_path)  # remove corrupt file
+      rm(int_vals)
     } else {
-      m_inside <- matrix(as.integer(raw_vals), nrow = length(inside_idx), ncol = n_weeks)
-      rm(raw_vals)
+      m_inside <- matrix(int_vals, nrow = length(inside_idx), ncol = n_weeks)
+      rm(int_vals)
       # Cache is only written for passing-threshold species; .skip handles the rest.
       # Skipping max() over 104 M cells per species is the main cached-run speedup.
-      # If you change possible_occurrence_threshold, delete r_sp_cache/ to rebuild.
+
       sp_codes_in_region <- c(sp_codes_in_region, sp_code)
       ind_inside <- m_inside > thresh_uint8  # logical; integer coercion on +
       rm(m_inside)
