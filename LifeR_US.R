@@ -453,15 +453,15 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
     } else {
       m_inside <- matrix(as.integer(raw_vals), nrow = length(inside_idx), ncol = n_weeks)
       rm(raw_vals)
-      if (max(m_inside) > thresh_uint8) {
-        sp_codes_in_region <- c(sp_codes_in_region, sp_code)
-        ind_inside <- m_inside > thresh_uint8
-        storage.mode(ind_inside) <- "integer"
-        if (is.null(accum)) accum <- matrix(0L, nrow = length(inside_idx), ncol = n_weeks)
-        accum <- accum + ind_inside
-        rm(ind_inside)
-      }
+      # Cache is only written for passing-threshold species; .skip handles the rest.
+      # Skipping max() over 104 M cells per species is the main cached-run speedup.
+      # If you change possible_occurrence_threshold, delete r_sp_cache/ to rebuild.
+      sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+      ind_inside <- m_inside > thresh_uint8  # logical; integer coercion on +
       rm(m_inside)
+      if (is.null(accum)) accum <- matrix(0L, nrow = length(inside_idx), ncol = n_weeks)
+      accum <- accum + ind_inside
+      rm(ind_inside)
       if (sp_idx %% gc_every == 0L) gc()
       next
     }
@@ -499,8 +499,7 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
     writeBin(as.raw(pmin(255L, as.integer(inside_float * 255))), sp_cache_path)
 
   # Accumulate inside-only -- no full-grid scatter per species.
-  ind_inside <- inside_float > possible_occurrence_threshold
-  storage.mode(ind_inside) <- "integer"
+  ind_inside <- inside_float > possible_occurrence_threshold  # logical; integer coercion on +
   rm(inside_float)
 
   if (is.null(accum)) accum <- matrix(0L, nrow = length(inside_idx), ncol = n_weeks)
@@ -543,25 +542,18 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
 }
 gc()
 
-# Wrap the 52-column accumulator back into one SpatRaster per week.
-# Cost: 52 terra::setValues() calls  -  trivial vs 561 x 52 terra ops before.
-possible_lifers <- vector("list", n_weeks)
-if (!is.null(accum) && !is.null(raster_template)) {
-  template_single <- raster_template[[1L]]
-  n_cells_full    <- terra::ncell(template_single)
-  for (wk in seq_len(n_weeks)) {
-    r_wk <- template_single
-    v <- numeric(n_cells_full)          # outside cells = 0 (masked later by study_area_5070)
-    v[inside_idx] <- accum[, wk]        # single scatter per week, not per species
-    terra::values(r_wk) <- v
-    names(r_wk) <- week_dates[wk]
-    possible_lifers[[wk]] <- r_wk
-  }
-  rm(template_single, n_cells_full, v)
-  rm(accum, raster_template)
-} else {
+# Scatter all 52 weeks into the 52-layer template in one matrix assignment.
+# One terra::values<- call replaces 52 allocate-fill-assign iterations.
+if (is.null(accum) || is.null(raster_template)) {
   stop("Accumulation produced no valid rasters - check that species tifs exist and region/resolution are correct.")
 }
+n_cells_full <- terra::ncell(raster_template[[1L]])
+v_full <- matrix(0L, nrow = n_cells_full, ncol = n_weeks)
+v_full[inside_idx, ] <- accum
+rm(accum)
+terra::values(raster_template) <- v_full
+rm(v_full)
+names(raster_template) <- week_dates
 
 # New version of species data frame with only species meeting occ threshold
 sp_ebst_for_run_in_region <- sp_ebst_for_run %>%
@@ -577,16 +569,17 @@ if (annotate == TRUE) {
   rm(polys_list); gc()
 }
 
-# Reproject, mask, and trim weekly lifer count rasters for plotting
-message("Reprojecting 52 weekly rasters...")
+# Reproject, mask, and trim the full 52-layer stack in 3 terra operations
+# instead of 3 x 52 = 156 individual-raster calls.
+message("Reprojecting 52-layer stack...")
 t_reproj <- proc.time()["elapsed"]
 study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
-possible_lifers <- lapply(possible_lifers, function(r) {
-  r <- terra::project(r, y = "epsg:5070", method = "near")
-  r <- terra::mask(r, mask = study_area_5070)
-  terra::trim(r)
-})
+raster_template <- terra::project(raster_template, y = "epsg:5070", method = "near")
+raster_template <- terra::mask(raster_template, mask = study_area_5070)
+raster_template <- terra::trim(raster_template)
 message(sprintf("  Reprojection complete in %.1fs", proc.time()["elapsed"] - t_reproj))
+possible_lifers <- lapply(seq_len(n_weeks), function(i) raster_template[[i]])
+rm(raster_template)
 gc()
 
 # polys was already finalised above
@@ -707,7 +700,7 @@ Data from 2023 eBird Status & Trends products (https://ebird.org/science/status-
   week_plot
   ggsave(filename = png_path, plot = week_plot, bg = "white", width = 1920, height = 1600, units = "px")
   rm(week_plot)
-  gc()
+  if (i %% 5L == 0L) gc()
 }
 message(sprintf("  Rendering complete in %.1fs", proc.time()["elapsed"] - t_render))
 rm(possible_lifers)
