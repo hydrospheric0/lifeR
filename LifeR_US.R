@@ -386,6 +386,59 @@ if (!is.null(raster_template)) {
     sum(!outside_mask), length(outside_mask), 100 * mean(!outside_mask)))
 }
 
+# Flat integer index of inside-boundary cells -- used to scatter/gather the cache.
+inside_idx <- if (!is.null(outside_mask)) which(!outside_mask) else NULL
+
+# Week dates from the probe raster layer names (needed even when every species
+# is a cache hit and names(r) is never called inside the loop).
+week_dates_probe <- if (!is.null(raster_template)) names(raster_template) else NULL
+
+# Threshold in uint8 space (precomputed once; avoids per-species float multiply).
+thresh_uint8 <- as.integer(round(possible_occurrence_threshold * 255))
+
+# ---------------------------------------------------------------------------
+# R species cache  (uint8 binary, built transparently on first run)
+#
+# Format: one <code>.bin per species  -  raw uint8 flat vector, row-major,
+#   (n_inside x n_weeks), occurrence scaled to 0-255 (0.0-1.0).
+# Meta: _meta.rds stores inside_idx + geometry fingerprint for validity.
+#
+# First run : reads TIF (332 MB) + writes 46 MB cache.  ~15% I/O overhead.
+# Run 2+    : reads 46 MB cache only.  ~7x less I/O than float32 TIF.
+# Cache is NOT annotation-aware -- annotation always uses the TIF slow path.
+# ---------------------------------------------------------------------------
+r_sp_cache_dir       <- here("data", "r_sp_cache", region, resolution, "2023")
+r_sp_cache_meta_path <- file.path(r_sp_cache_dir, "_meta.rds")
+dir.create(r_sp_cache_dir, recursive = TRUE, showWarnings = FALSE)
+r_sp_cache_valid <- FALSE
+if (!is.null(inside_idx)) {
+  needs_new_meta <- FALSE
+  if (!file.exists(r_sp_cache_meta_path)) {
+    needs_new_meta <- TRUE
+    message(sprintf("  R sp cache: new at %s  (will populate this run)", r_sp_cache_dir))
+  } else {
+    meta_chk <- tryCatch(readRDS(r_sp_cache_meta_path), error = function(e) NULL)
+    if (is.null(meta_chk) ||
+        meta_chk$n_cells != length(outside_mask) ||
+        meta_chk$n_weeks != n_weeks) {
+      message("  R sp cache: geometry mismatch -- clearing and rebuilding")
+      invisible(file.remove(list.files(r_sp_cache_dir, full.names = TRUE)))
+      needs_new_meta <- TRUE
+    } else {
+      r_sp_cache_valid <- TRUE
+      n_cached <- length(list.files(r_sp_cache_dir, pattern = "\\.bin$"))
+      message(sprintf("  R sp cache: %d / %d species cached  (fast path for hits)",
+        n_cached, nrow(sp_ebst_for_run)))
+    }
+  }
+  if (needs_new_meta) {
+    saveRDS(list(inside_idx = inside_idx, n_cells = length(outside_mask),
+                 n_weeks = n_weeks, week_dates = week_dates_probe),
+            r_sp_cache_meta_path)
+    r_sp_cache_valid <- TRUE  # cache is ready to populate this run
+  }
+}
+
 # gc() cadence: every ~gc_every species.  Larger = fewer gc() calls = faster;
 # smaller = lower peak RAM.  ~50 is a good balance at any resolution.
 avail_gb_now <- tryCatch(
@@ -400,7 +453,7 @@ message(sprintf("  gc() every %d species  (%.0f GB free)",
 # Pre-allocate the integer accumulator matrix: n_cells x 52.
 # NA outside the boundary is handled by treating NA values as 0 during accumulation.
 accum          <- NULL   # lazy-init on first valid species (need actual n_cells)
-week_dates     <- NULL
+week_dates     <- week_dates_probe   # from probe; overwritten on first TIF slow path
 sp_codes_in_region <- character(0)
 if (annotate == TRUE) polys_list <- list()
 
@@ -414,6 +467,37 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
 
   sp_code <- sp_ebst_for_run$species_code[sp_idx]
 
+  sp_cache_path <- if (r_sp_cache_valid && annotate == FALSE)
+    file.path(r_sp_cache_dir, paste0(sp_code, ".bin")) else NULL
+
+  if (!is.null(sp_cache_path) && file.exists(sp_cache_path)) {
+    # ---- Fast path: 46 MB uint8 cache read vs 332 MB float32 TIF ----
+    raw_vals <- tryCatch(
+      readBin(sp_cache_path, raw(), n = length(inside_idx) * n_weeks),
+      error = function(e) { message("  Cache read error: ", sp_code); NULL })
+    cache_ok <- !is.null(raw_vals) && length(raw_vals) == length(inside_idx) * n_weeks
+    if (!cache_ok) {
+      if (!is.null(raw_vals)) file.remove(sp_cache_path)  # remove corrupt file
+      rm(raw_vals)
+    } else {
+      m_inside <- matrix(as.integer(raw_vals), nrow = length(inside_idx), ncol = n_weeks)
+      rm(raw_vals)
+      if (max(m_inside) > thresh_uint8) {
+        sp_codes_in_region <- c(sp_codes_in_region, sp_code)
+        indicator <- matrix(0L, nrow = length(outside_mask), ncol = n_weeks)
+        indicator[inside_idx, ] <- (m_inside > thresh_uint8)
+        storage.mode(indicator) <- "integer"
+        if (is.null(accum)) accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
+        accum <- accum + indicator
+        rm(indicator)
+      }
+      rm(m_inside)
+      if (sp_idx %% gc_every == 0L) gc()
+      next
+    }
+  }
+
+  # ---- Slow path: read float32 TIF; write uint8 cache for next run ----
   r <- load_raster_safe(sp_code, product = "occurrence", period = "weekly",
                         metric = "median", resolution = resolution)
   if (is.null(r)) next
@@ -421,28 +505,33 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
   r <- terra::crop(r, fixed_ext)
   if (is.null(week_dates)) week_dates <- names(r)
 
-  # Extract to raw matrix; apply pre-computed boundary mask (single vector op,
-  # no polygon rasterization per species).
-  vals <- terra::values(r)              # n_cells x 52 numeric matrix
+  # terra::values() inflates float32 -> float64 (~664 MB at 3km).
+  # Immediately subset to inside cells and free the full grid;
+  # then convert to 0-255 integer (185 MB vs 664 MB) before any matrix ops.
+  vals_full <- terra::values(r)
   rm(r)
-  if (!is.null(outside_mask)) vals[outside_mask, ] <- NA_real_
+  inside_float <- vals_full[inside_idx, , drop = FALSE]   # n_inside x n_weeks
+  rm(vals_full)                                            # free 664 MB ASAP
+  inside_float[is.na(inside_float)] <- 0
+  uint_mat <- matrix(pmin(255L, pmax(0L, as.integer(round(inside_float * 255L)))),
+                     nrow = length(inside_idx), ncol = n_weeks)
+  rm(inside_float)
 
-  # Skip species with no occurrence above threshold inside the boundary
-  inside_max <- if (!is.null(outside_mask)) max(vals[!outside_mask, ], na.rm = TRUE)
-                else max(vals, na.rm = TRUE)
-  if (is.na(inside_max) || inside_max <= possible_occurrence_threshold) { rm(vals); next }
+  if (max(uint_mat) <= thresh_uint8) { rm(uint_mat); next }
 
   sp_codes_in_region <- c(sp_codes_in_region, sp_code)
 
-  indicator <- (vals > possible_occurrence_threshold)
-  indicator[is.na(indicator)] <- FALSE
-  storage.mode(indicator) <- "integer"  # 0/1 integer, not logical
-  rm(vals)
+  # Write uint8 cache as a side effect -- zero extra I/O work since we already
+  # have the compact integer matrix; next run takes the fast path above.
+  if (!is.null(sp_cache_path) && !file.exists(sp_cache_path))
+    writeBin(as.raw(uint_mat), sp_cache_path)
 
-  # Lazy-init accumulator on first valid species
-  if (is.null(accum)) {
-    accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
-  }
+  # Scatter indicator back to full grid for the accumulator
+  indicator <- matrix(0L, nrow = length(outside_mask), ncol = n_weeks)
+  indicator[inside_idx, ] <- (uint_mat > thresh_uint8)
+  rm(uint_mat)
+
+  if (is.null(accum)) accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
   accum <- accum + indicator
   rm(indicator)
 
