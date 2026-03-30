@@ -597,17 +597,23 @@ if (annotate == TRUE) {
   rm(polys_list); gc()
 }
 
-# Reproject, mask, and trim each weekly raster individually.
-# Per-layer ops keep each raster small enough for terra to hold in RAM;
-# a 52-layer stack would be spilled to disk, making downstream reads slow.
+# Reproject, mask, and trim as a single 52-layer stack.
+# 52 serial project() calls have per-call terra overhead (grid recomputation,
+# PROJ initialisation, etc.) that dominates at fine resolutions.  Stacking the
+# layers first reduces that to one call each for project/mask/trim, then split()
+# returns the list of single-layer rasters the render loop expects.
+# Stack size at 3km: ~114 MB (integer) -- well within terra memfrac; no disk spill.
 message("Reprojecting 52 weekly rasters...")
 t_reproj <- proc.time()["elapsed"]
 study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
-possible_lifers <- lapply(possible_lifers, function(r) {
-  r <- terra::project(r, y = "epsg:5070", method = "near")
-  r <- terra::mask(r, mask = study_area_5070)
-  terra::trim(r)
-})
+stack_8857 <- do.call(terra::c, possible_lifers)
+rm(possible_lifers)
+stack_5070 <- terra::project(stack_8857, y = "epsg:5070", method = "near")
+rm(stack_8857)
+stack_5070 <- terra::mask(stack_5070, mask = study_area_5070)
+stack_5070 <- terra::trim(stack_5070)
+possible_lifers <- lapply(seq_len(terra::nlyr(stack_5070)), function(i) stack_5070[[i]])
+rm(stack_5070)
 message(sprintf("+ reprojection: %.1fs  [RAM] rss=%.1fGB avail=%.1fGB",
   proc.time()["elapsed"] - t_reproj, get_process_rss_gb(), get_available_ram_gb()))
 gc()
