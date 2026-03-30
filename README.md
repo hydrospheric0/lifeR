@@ -14,16 +14,14 @@ This repository is a fork of [smsfrn/lifeR](https://github.com/smsfrn/lifeR).
 |------|-------------|
 | `LifeR_US.R` | Current working version — all improvements applied, US/CONUS |
 | `LifeR_NL.R` | Netherlands adaptation of the same improved script |
-| `lifeR_original_runnable.R` | Sam Safran's original code adapted for unattended runs (magick→gifski, interactive calls removed); useful as a benchmark baseline |
 | `install_packages.R` | Standalone R package installer |
 | `config_local.R.example` | Template for local API key config (copy → `config_local.R`) |
-| `benchmark_compare.sh` | Shell script to time-and-RAM compare original vs current at any resolution |
 
 ---
 
 ## Changes from upstream
 
-All changes are relative to [`lifeR_original.R`](lifeR_original.R) (Sam Safran's original code).
+All changes are relative to Sam Safran's original code at [smsfrn/lifeR](https://github.com/smsfrn/lifeR).
 
 ### Setup & portability
 - **User R library path** — added `.libPaths()` so packages installed to `~/R/library` are found without modifying system R

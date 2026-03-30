@@ -15,10 +15,13 @@ ne_admin1_large.rds
 
 # Benchmark artefacts
 benchmark.sh
+benchmark_compare.sh
 benchmark_results/
+BENCHMARK_RESULTS.md
 
 # Intermediate/archived script versions
 LifeR_US_original.R
+lifeR_original_runnable.R
 
 # eBird taxonomy export and supporting scripts
 ebirdst_runs.csv
