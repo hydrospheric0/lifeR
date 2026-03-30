@@ -7,6 +7,94 @@ All data cached locally (no network I/O). Frames skipped if already on disk.
 
 ---
 
+## Summary: current script across all resolutions
+
+| Resolution | Run type | Wall time | Accumulation | Peak RSS |
+|-----------|----------|-----------|-------------|---------|
+| 27km | cold (no cache) | **3:12** | 1:04 | 0.9 GB |
+| 27km | warm (cache hit) | **1:30** | 0:38 | 1.4 GB |
+| 9km  | cold (no cache) | **8:49** | 7:44 | 1.5 GB |
+| 3km  | cold (no cache) | **~30:xx** | ~27:xx | ~7 GB |
+| 3km  | warm (cache hit)| **~4:xx**  | ~2:xx  | ~7 GB |
+
+3km warm-cache estimate based on 9km ratio (~5× faster accumulation on cache hits).  
+Cold run: reads TIFs + writes .bin cache + creates .skip markers (one-time overhead).  
+Warm run: reads .bin files only (194 × ~46 MB vs 561 × 332 MB TIFs).
+
+---
+
+## Original vs current: 27km
+
+| Metric | Original (Sam's) | Current (cold) | Current (warm) |
+|--------|-----------------|----------------|----------------|
+| Wall time | 1:26 | 3:12 | **1:30** |
+| Accumulation | 25s | 1:04 | 0:38 |
+| Reproject | 7s | 6s | 6s |
+| Frame render | ~0s (cached) | 30s | ~0s (cached) |
+| **Peak RSS** | **7.4 GB** | **0.9 GB** | **1.4 GB** |
+
+---
+
+## Original vs current: 9km
+
+| Metric | Original (Sam's) | Current (cold) | Current (warm) |
+|--------|-----------------|----------------|----------------|
+| Wall time | 5:37 | **8:49** | **~2:xx** |
+| Accumulation | 1:26 | 7:44 | ~1:xx |
+| Peak at crop+mask | **71.4 GB** | n/a | n/a |
+| Reproject | 13s | 12s | 12s |
+| Frame render | ~0s (cached) | 40s | ~0s (cached) |
+| **Peak RSS** | **64.2 GB** | **1.5 GB** | **1.5 GB** |
+
+Original peaks at 64 GB during batch crop+mask. OOMs on any machine <70 GB.  
+Current streams one species at a time; stays under 2 GB throughout.
+
+---
+
+## Original vs current: 3km
+
+| Metric | Original (Sam's) | Current (cold) | Current (warm) |
+|--------|-----------------|----------------|----------------|
+| Wall time | OOM / untested | **~30 min** | **~4 min** |
+| Peak RSS | OOM (est. >>200 GB) | **~7 GB** | **~7 GB** |
+
+Original would load 561 × 332 MB = ~186 GB simultaneously before crop+mask. Not runnable on any machine <200 GB RAM.
+
+---
+
+## Key optimizations in this fork
+
+| Optimization | Effect |
+|-------------|--------|
+| **Boundary mask pre-computed once** | Eliminates ~500 polygon rasterizations; reused as logical vector |
+| **Logical mask subsetting** | `vals[!outside_mask,]` bulk copy vs `vals[inside_idx,]` fancy indexing — substantially faster |
+| **Inside-only accumulator** | `(n_inside × 52)` not `(n_cells × 52)`; no full-grid scatter per species |
+| **uint8 .bin cache (side effect)** | Written on first run; reruns read 46 MB instead of 332 MB TIF — ~7× less I/O |
+| **.skip marker for below-threshold** | Future runs skip 367 TIF reads entirely (species confirmed absent in region) |
+| **Single wrap-back scatter** | One `v[inside_idx] <- accum[,wk]` per week at end, not per species |
+| **Peak RSS: float64 freed immediately** | `rm(vals_full)` before any further allocations keeps peak under 2 GB |
+| **Single-layer raster template** | `raster_template[[1L]]` prevents 52-layer copies into possible_lifers list |
+| **gifski replaces magick** | Rust GIF encoder — no ImageMagick pixel-cache OOM, no segfault on large frames |
+| **Cached NaturalEarth boundaries** | `ne_admin1_large.rds` — skips network call on reruns |
+| **Frame/GIF skip if exists** | Resume-safe: reruns skip already-rendered PNGs and existing GIFs |
+
+---
+
+## Phase timeline (9km, cold cache)
+
+```
+  0s   START              (packages loaded, hardware detected)
+  6s   species_discovery  (eBird API + taxonomy join: 561 modelled needs)
+  8s   download_check     (all TIFs cached, no downloads)
+464s   after_accumulation (streaming: 561 species, 194 pass threshold)
+477s   after_reproject    (52 rasters EPSG:8857 -> EPSG:5070)
+517s   after_frame_render (52 PNG frames @ 1920x1600)
+529s   DONE               (hi-res + lo-res GIF assembled)
+```
+
+
+---
+
 ## Summary: current script (LifeR_US.R) across all resolutions
 
 | Resolution | Wall time | Accumulation | Reproject | Frame render | GIF assembly | Peak RSS |

@@ -44,10 +44,7 @@ here()
 
 bench_checkpoint("START")
 # ---------------------------------------------------------------------------
-n_cores_physical <- max(1L, parallel::detectCores(logical = FALSE))
-n_cores_logical  <- max(1L, parallel::detectCores(logical = TRUE))
-# Leave at least 2 physical cores free for OS / other tasks
-n_workers <- max(1L, n_cores_physical - 2L)
+n_cores_logical <- max(1L, parallel::detectCores(logical = TRUE))
 
 # Available RAM (Linux /proc/meminfo, fallback for macOS/other)
 get_available_ram_gb <- function() {
@@ -111,11 +108,10 @@ check_disk_space <- function(min_gb = 2, path = here()) {
 
 ram_gb  <- get_available_ram_gb()
 disk_gb <- get_available_disk_gb()
-message(sprintf("[hardware] %d physical cores, %d logical | %.0f GB RAM available | %.0f GB disk free",
-  n_cores_physical, n_cores_logical,
+message(sprintf("[hardware] %d logical cores | %.0f GB RAM available | %.0f GB disk free",
+  n_cores_logical,
   ifelse(is.na(ram_gb), -1, ram_gb),
   ifelse(is.na(disk_gb), -1, disk_gb)))
-message(sprintf("[hardware] Using %d workers for parallel operations", n_workers))
 
 # Store S&T rasters in the project folder (data/ebirdst/) rather than the
 # hidden R per-user directory.  Python scripts and R scripts share this path.
@@ -328,18 +324,14 @@ message(sprintf("terra: memfrac=%.2f (%.1f GB of %.1f GB total), threads=%d",
   memfrac_safe, memfrac_safe * mem_total_kb / 1e6, mem_total_kb / 1e6, nc))
 
 # ---------------------------------------------------------------------------
-# Matrix accumulation  -  avoids 29,000 terra object operations.
-#
-# Strategy:
-#   1. Crop + mask each species raster with terra (unavoidable).
-#   2. Immediately call terra::values() to extract a raw integer matrix
-#      (n_cells x 52).  NA outside boundary = 0 for accumulation.
-#   3. Add to one integer accumulator matrix  -  plain R + over n_cells x 52.
-#   4. After all species: wrap each of 52 columns back into a SpatRaster
-#      (cost: 52 terra::setValues() calls, not 561 x 52 terra ops).
-#
-# chunk_size controls gc() cadence only  -  no longer affects sum strategy.
-# chunk_size=1 -> gc() every species; larger -> gc() every N species.
+# Accumulation strategy
+#   1. crop() to fixed extent (no polygon rasterization per species call)
+#   2. terra::values() -> subset inside cells via !outside_mask (logical, fast)
+#      -> free full float64 grid immediately (~664 MB at 3km)
+#   3. Write uint8 .bin cache as side effect; reruns skip TIF entirely
+#   4. Write .skip marker for below-threshold species; reruns skip those too
+#   5. Accumulate inside-only (n_inside x 52) -- no full-grid scatter per species
+#   6. Wrap-back: one scatter (inside -> full grid) per week at the end
 # ---------------------------------------------------------------------------
 
 # Convert study_area to a terra SpatVector once; reused for the probe.
@@ -450,9 +442,9 @@ gc_every <- if (!is.na(avail_gb_now)) {
 message(sprintf("  gc() every %d species  (%.0f GB free)",
   gc_every, ifelse(is.na(avail_gb_now), -1, avail_gb_now)))
 
-# Pre-allocate the integer accumulator matrix: n_cells x 52.
-# NA outside the boundary is handled by treating NA values as 0 during accumulation.
-accum          <- NULL   # lazy-init on first valid species (need actual n_cells)
+# Accumulator is inside-only (n_inside x n_weeks) -- no full-grid scatter per species.
+# Lazy-init on first valid species.
+accum          <- NULL
 week_dates     <- week_dates_probe   # from probe; overwritten on first TIF slow path
 sp_codes_in_region <- character(0)
 if (annotate == TRUE) polys_list <- list()
@@ -470,6 +462,9 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
   sp_cache_path <- if (r_sp_cache_valid && annotate == FALSE)
     file.path(r_sp_cache_dir, paste0(sp_code, ".bin")) else NULL
 
+  # Skip marker: this species was confirmed below threshold in a prior run.
+  if (!is.null(sp_cache_path) && file.exists(paste0(sp_cache_path, ".skip"))) next
+
   if (!is.null(sp_cache_path) && file.exists(sp_cache_path)) {
     # ---- Fast path: 46 MB uint8 cache read vs 332 MB float32 TIF ----
     raw_vals <- tryCatch(
@@ -484,12 +479,11 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
       rm(raw_vals)
       if (max(m_inside) > thresh_uint8) {
         sp_codes_in_region <- c(sp_codes_in_region, sp_code)
-        indicator <- matrix(0L, nrow = length(outside_mask), ncol = n_weeks)
-        indicator[inside_idx, ] <- (m_inside > thresh_uint8)
-        storage.mode(indicator) <- "integer"
-        if (is.null(accum)) accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
-        accum <- accum + indicator
-        rm(indicator)
+        ind_inside <- m_inside > thresh_uint8
+        storage.mode(ind_inside) <- "integer"
+        if (is.null(accum)) accum <- matrix(0L, nrow = length(inside_idx), ncol = n_weeks)
+        accum <- accum + ind_inside
+        rm(ind_inside)
       }
       rm(m_inside)
       if (sp_idx %% gc_every == 0L) gc()
@@ -503,37 +497,39 @@ for (sp_idx in seq_len(nrow(sp_ebst_for_run))) {
   if (is.null(r)) next
 
   r <- terra::crop(r, fixed_ext)
-  if (is.null(week_dates)) week_dates <- names(r)
 
   # terra::values() inflates float32 -> float64 (~664 MB at 3km).
-  # Immediately subset to inside cells and free the full grid;
-  # then convert to 0-255 integer (185 MB vs 664 MB) before any matrix ops.
+  # Subset inside cells with logical mask (fast bulk copy vs integer index);
+  # free the full grid immediately before any further allocations.
   vals_full <- terra::values(r)
   rm(r)
-  inside_float <- vals_full[inside_idx, , drop = FALSE]   # n_inside x n_weeks
-  rm(vals_full)                                            # free 664 MB ASAP
+  inside_float <- vals_full[!outside_mask, , drop = FALSE]  # n_inside x n_weeks
+  rm(vals_full)
   inside_float[is.na(inside_float)] <- 0
-  uint_mat <- matrix(pmin(255L, pmax(0L, as.integer(round(inside_float * 255L)))),
-                     nrow = length(inside_idx), ncol = n_weeks)
-  rm(inside_float)
 
-  if (max(uint_mat) <= thresh_uint8) { rm(uint_mat); next }
+  if (max(inside_float) <= possible_occurrence_threshold) {
+    rm(inside_float)
+    # Write .skip marker so future runs bypass this TIF entirely.
+    if (!is.null(sp_cache_path))
+      file.create(paste0(sp_cache_path, ".skip"), showWarnings = FALSE)
+    next
+  }
 
   sp_codes_in_region <- c(sp_codes_in_region, sp_code)
 
-  # Write uint8 cache as a side effect -- zero extra I/O work since we already
-  # have the compact integer matrix; next run takes the fast path above.
+  # Write uint8 cache: 2 allocations (×255 + as.integer), not 5.
+  # Only for passing species; pmax not needed (occurrence >= 0 by definition).
   if (!is.null(sp_cache_path) && !file.exists(sp_cache_path))
-    writeBin(as.raw(uint_mat), sp_cache_path)
+    writeBin(as.raw(pmin(255L, as.integer(inside_float * 255))), sp_cache_path)
 
-  # Scatter indicator back to full grid for the accumulator
-  indicator <- matrix(0L, nrow = length(outside_mask), ncol = n_weeks)
-  indicator[inside_idx, ] <- (uint_mat > thresh_uint8)
-  rm(uint_mat)
+  # Accumulate inside-only -- no full-grid scatter per species.
+  ind_inside <- inside_float > possible_occurrence_threshold
+  storage.mode(ind_inside) <- "integer"
+  rm(inside_float)
 
-  if (is.null(accum)) accum <- matrix(0L, nrow = nrow(indicator), ncol = ncol(indicator))
-  accum <- accum + indicator
-  rm(indicator)
+  if (is.null(accum)) accum <- matrix(0L, nrow = length(inside_idx), ncol = n_weeks)
+  accum <- accum + ind_inside
+  rm(ind_inside)
 
   # gc() every gc_every species to keep peak RAM bounded
   if (sp_idx %% gc_every == 0L) gc()
@@ -575,14 +571,17 @@ gc()
 # Cost: 52 terra::setValues() calls  -  trivial vs 561 x 52 terra ops before.
 possible_lifers <- vector("list", n_weeks)
 if (!is.null(accum) && !is.null(raster_template)) {
-  template_single <- raster_template[[1L]]  # single-layer shell; avoids 52-layer copies
+  template_single <- raster_template[[1L]]
+  n_cells_full    <- terra::ncell(template_single)
   for (wk in seq_len(n_weeks)) {
     r_wk <- template_single
-    terra::values(r_wk) <- accum[, wk]
+    v <- numeric(n_cells_full)          # outside cells = 0 (masked later by study_area_5070)
+    v[inside_idx] <- accum[, wk]        # single scatter per week, not per species
+    terra::values(r_wk) <- v
     names(r_wk) <- week_dates[wk]
     possible_lifers[[wk]] <- r_wk
   }
-  rm(template_single)
+  rm(template_single, n_cells_full, v)
   rm(accum, raster_template)
 } else {
   stop("Accumulation produced no valid rasters - check that species tifs exist and region/resolution are correct.")
@@ -645,7 +644,6 @@ max_val_possible <- lapply(possible_lifers, minmax) %>%
 legend_breaks <- c(pretty(1:max_val_possible))
 labels <- function(x) {
   lab <- " species"
-  chars <- nchar(paste0(tail(x, n = 1), lab))
   x_last <- as.character(paste0(tail(x, n = 1), lab))
   x_last_pad <- str_pad(x_last, nchar(x_last) * 2 + nchar(tail(x, n = 1)) + 1, side = "left")
   c(x[1:(length(x) - 1)], x_last_pad)
