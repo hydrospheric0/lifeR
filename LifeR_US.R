@@ -606,7 +606,7 @@ if (annotate == TRUE) {
 message("Reprojecting 52 weekly rasters...")
 t_reproj <- proc.time()["elapsed"]
 study_area_5070 <- terra::project(study_area_vect, y = "epsg:5070")
-stack_8857 <- do.call(terra::c, possible_lifers)
+stack_8857 <- terra::rast(possible_lifers)
 rm(possible_lifers)
 stack_5070 <- terra::project(stack_8857, y = "epsg:5070", method = "near")
 rm(stack_8857)
